@@ -32,9 +32,9 @@ class SevenNetCalculator(Calculator):
         file_type: str = 'checkpoint',
         device: Union[torch.device, str] = 'auto',
         modal: Optional[str] = None,
-        enable_cueq: Optional[bool] = False,
-        enable_flash: Optional[bool] = False,
-        enable_oeq: Optional[bool] = False,
+        enable_cueq: bool = False,
+        enable_flash: bool = False,
+        enable_oeq: bool = False,
         compute_atomic_virial: bool = False,
         sevennet_config: Optional[Dict] = None,  # Not used in logic, just meta info
         **kwargs,
@@ -57,9 +57,9 @@ class SevenNetCalculator(Calculator):
             'mp_r2scan', 'oc20', 'oc22', 'odac23', 'omol25_low', 'omol25_high',
             'spice', 'qcml', 'pet_mad'
             case insensitive
-        enable_cueq: bool, default=None (use the checkpoint's backend)
+        enable_cueq: bool, default=False
             if True, use cuEquivariant to accelerate inference.
-        enable_flash: bool, default=None (use the checkpoint's backend)
+        enable_flash: bool, default=False
             if True, use FlashTP to accelerate inference.
         enable_oeq: bool, default=False
             if True, use OpenEquivariance to accelerate inference.
@@ -240,9 +240,9 @@ class SevenNetD3Calculator(SumCalculator):
         file_type: str = 'checkpoint',
         device: Union[torch.device, str] = 'auto',
         modal: Optional[str] = None,
-        enable_cueq: Optional[bool] = False,
-        enable_flash: Optional[bool] = False,
-        enable_oeq: Optional[bool] = False,
+        enable_cueq: bool = False,
+        enable_flash: bool = False,
+        enable_oeq: bool = False,
         sevennet_config: Optional[Any] = None,
         damping_type: str = 'damp_bj',
         functional_name: str = 'pbe',
