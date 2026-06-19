@@ -227,4 +227,8 @@ def get_loss_functions_from_config(
         if loss_function.criterion is None:
             loss_function.assign_criteria(criterion)
 
+    from sevenn.train.reewc.loss import append_ewc_loss
+
+    append_ewc_loss(loss_functions, config)
+
     return loss_functions

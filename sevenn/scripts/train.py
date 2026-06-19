@@ -11,6 +11,12 @@ from sevenn.model_build import build_E3_equivariant_model
 from sevenn.scripts.processing_continue import (
     convert_modality_of_checkpoint_state_dct,
 )
+from sevenn.train.reewc import (
+    ReewcTrainer,
+    build_memory_loader,
+    reewc_dataset_keys,
+    validate_reewc_config,
+)
 from sevenn.train.trainer import Trainer
 
 
@@ -55,6 +61,8 @@ def train_v2(config: Dict[str, Any], working_dir: str) -> None:
         log.writeline('***************************************************')
         config[KEY.LOAD_TRAINSET] = config.pop(KEY.LOAD_DATASET)
 
+    validate_reewc_config(config)
+
     # config updated
     start_epoch = 1
     state_dicts: Optional[List[dict]] = None
@@ -64,7 +72,9 @@ def train_v2(config: Dict[str, Any], working_dir: str) -> None:
     if config.get(KEY.USE_MODALITY, False):
         datasets = modal_dataset.from_config(config, working_dir)
     elif config[KEY.DATASET_TYPE] == 'graph':
-        datasets = graph_dataset.from_config(config, working_dir)
+        datasets = graph_dataset.from_config(
+            config, working_dir, dataset_keys=reewc_dataset_keys(config)
+        )
     elif config[KEY.DATASET_TYPE] == 'atoms':
         datasets = atoms_dataset.from_config(config, working_dir)
     else:
@@ -74,11 +84,19 @@ def train_v2(config: Dict[str, Any], working_dir: str) -> None:
         for k, v in datasets.items()
     }
 
+    rehearsal = config.get(KEY.REHEARSAL, False)
+    memory_loader = build_memory_loader(config) if rehearsal else None
+
     log.write('\nModel building...\n')
     model = build_E3_equivariant_model(config)
     log.print_model_info(model, config)
 
-    trainer = Trainer.from_config(model, config)
+    if memory_loader is not None:
+        trainer = ReewcTrainer.from_config(
+            model, config, memory_loader=memory_loader
+        )
+    else:
+        trainer = Trainer.from_config(model, config)
     if state_dicts:
         trainer.load_state_dicts(*state_dicts, strict=False)
 

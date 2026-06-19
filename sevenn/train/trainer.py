@@ -82,7 +82,10 @@ class Trainer:
         self.loss_functions = loss_functions
 
     @staticmethod
-    def from_config(model: torch.nn.Module, config: Dict[str, Any]) -> 'Trainer':
+    def from_config(
+        model: torch.nn.Module,
+        config: Dict[str, Any],
+    ) -> 'Trainer':
         trainer = Trainer(
             model,
             loss_functions=get_loss_functions_from_config(config),
@@ -137,6 +140,7 @@ class Trainer:
         loader: Iterable,
         is_train: bool = False,
         error_recorder: Optional[ErrorRecorder] = None,
+        memory_error_recorder: Optional[ErrorRecorder] = None,
         wrap_tqdm: Union[bool, int] = False,
     ) -> None:
         """
@@ -155,6 +159,7 @@ class Trainer:
         if wrap_tqdm:
             total_len = wrap_tqdm if isinstance(wrap_tqdm, int) else None
             loader = tqdm(loader, total=total_len)
+
         for _, batch in enumerate(loader):
             if is_train:
                 self.optimizer.zero_grad()
