@@ -2,6 +2,11 @@
 All notable changes to this project will be documented in this file.
 
 ## [0.13.1.dev]
+### Added
+- Training features used for SevenNet-Omni: batch training, `OrderedSampler`, `grad_clip`, `onecyclelr`
+- Loss: MAE, L2MAE
+- Dataset type: `aselmdb`, `custom`
+
 ### Fixed
 - `D3Calculator()` segfault bug when reusing the calculator within different sized `Atoms`.
 
@@ -39,13 +44,12 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 - TorchSim interface and docs
+- SevenNet-Omni-i8, SevenNet-Omni-i12
 
 ## [0.12.0]
 ### Added
 - Documentation moved to RTD
 - LAMMPS-MLIAP integration with GhostExchangeOp
-
-### Added
 - SevenNet-Omni
 - Example config for fine-tuning the SevenNet-MF-ompa model
 - FlashTP support (https://github.com/SNU-ARC/flashTP)
