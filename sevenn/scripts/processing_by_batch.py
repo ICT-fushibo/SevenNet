@@ -158,7 +158,7 @@ def processing_by_batch(
         train_loader.sampler.refresh_sequence()  # make starting index to zero
 
     trainer.write_checkpoint(
-        f'{prefix}/checkpoint_initial.pth',
+        f'{prefix}/checkpoint_0.pth',
         config=config,
         epoch=0,
         data_progress=data_progress,
