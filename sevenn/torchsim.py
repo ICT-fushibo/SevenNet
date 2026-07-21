@@ -101,7 +101,9 @@ class SevenNetModel(ModelInterface):  # type: ignore[misc,valid-type]
             neighbor_list_fn (Callable): Neighbor list function to use.
                 Default is torch_nl_linked_cell.
             device (torch.device | str): Device to run the model on
-            dtype (torch.dtype): Data type for computation
+            dtype (torch.dtype): TorchSim interface dtype.  Only float32 is
+                supported; wrap with Float64Wrapper if outer TorchSim cell/state
+                arithmetic must run in double precision.
 
         Raises:
             ImportError: if torch_sim is not installed
@@ -166,9 +168,6 @@ class SevenNetModel(ModelInterface):  # type: ignore[misc,valid-type]
 
         self.model = model.to(self._device)
         self.model = self.model.eval()
-
-        if self._dtype is not None:
-            self.model = self.model.to(dtype=self._dtype)
 
         self.implemented_properties = ['energy', 'forces', 'stress']
 
@@ -282,13 +281,13 @@ class SevenNetModel(ModelInterface):  # type: ignore[misc,valid-type]
 
         forces = output[key.PRED_FORCE]
         if forces is not None:
-            results['forces'] = forces
+            results['forces'] = forces.to(dtype=self._dtype)
 
         stress = output[key.PRED_STRESS]
         if stress is not None:
             results['stress'] = -voigt_6_to_full_3x3_stress(
                 stress[..., [0, 1, 2, 4, 5, 3]],
-            )
+            ).to(dtype=self._dtype)
 
         results = {k: v.detach() for k, v in results.items()}
 
@@ -477,7 +476,7 @@ class SevenNetD3Model(ModelInterface):
         )
 
         results['energy'] += torch.from_numpy(d3_energy).to(
-            device=self._device, dtype=self._dtype,
+            device=self._device, dtype=results['energy'].dtype,
         )
         results['forces'] += torch.from_numpy(
             np.ascontiguousarray(d3_forces),
@@ -505,7 +504,8 @@ class Float64Wrapper(ModelInterface):
 
     Casts state tensors to float32 before calling the wrapped model, then
     casts outputs back to float64.  Reports ``dtype=float64`` to torch-sim
-    so all optimizer / integrator arithmetic is done in double precision.
+    so all cell algebra / optimizer / integrator arithmetic is done in double.
+    The wrapped model still receives a float32 ``SimState``.
 
     This is needed because ``SumModel`` requires all children to share the
     same dtype, and ``D3DispersionModel`` defaults to float64.

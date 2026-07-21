@@ -313,6 +313,13 @@ class SevenNetD3Calculator(SumCalculator):
 
         super().__init__([sevennet_calc, d3_calc])
 
+    def calculate(self, atoms=None, properties=None, system_changes=all_changes):
+        # To match the precision of SevenNetCalculator output
+        super().calculate(atoms, properties, system_changes)
+        for key in ('forces', 'stress', 'stresses'):
+            if key in self.results:
+                self.results[key] = np.asarray(self.results[key], dtype=np.float32)
+
 
 def _load(name: str) -> ctypes.CDLL:
     from torch.utils.cpp_extension import LIB_EXT, _get_build_directory, load
