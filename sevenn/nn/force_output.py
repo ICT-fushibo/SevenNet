@@ -152,6 +152,7 @@ class ForceStressOutputFromEdge(nn.Module):
         data_key_atomic_virial: str = KEY.PRED_ATOMIC_VIRIAL,
         data_key_cell_volume: str = KEY.CELL_VOLUME,
         use_atomic_virial: bool = False,
+        compute_stress: bool = True,
     ) -> None:
 
         super().__init__()
@@ -163,13 +164,18 @@ class ForceStressOutputFromEdge(nn.Module):
         self.key_atomic_virial = data_key_atomic_virial
         self.key_cell_volume = data_key_cell_volume
         self.use_atomic_virial = use_atomic_virial
+        self.compute_stress = compute_stress
         self._is_batch_data = True
 
     def get_grad_key(self) -> str:
         return self.key_edge
 
     def forward(self, data: AtomGraphDataType) -> AtomGraphDataType:
-        tot_num = torch.sum(data[KEY.NUM_ATOMS])  # ? item?
+        # Tensor shapes are host metadata and do not synchronize CUDA.  The old
+        # ``sum(NUM_ATOMS)`` produced a CUDA scalar which was then consumed as
+        # an allocation size, introducing a device-to-host synchronization in
+        # every force evaluation.
+        tot_num = data[KEY.ATOMIC_NUMBERS].shape[0]
         rij = data[self.key_edge]
         energy = [(data[self.key_energy]).sum()]
         edge_idx = data[self.key_edge_idx]
@@ -194,46 +200,46 @@ class ForceStressOutputFromEdge(nn.Module):
             nf.scatter_reduce_(0, _edge_dst, fij, reduce='sum')
             data[self.key_force] = pf - nf
 
-            # compute virial
-            diag = rij * fij
-            s12 = rij[..., 0] * fij[..., 1]
-            s23 = rij[..., 1] * fij[..., 2]
-            s31 = rij[..., 2] * fij[..., 0]
-            # cat last dimension
-            _virial = torch.cat([
-                diag,
-                s12.unsqueeze(-1),
-                s23.unsqueeze(-1),
-                s31.unsqueeze(-1)
-            ], dim=-1)
+            # Virial/stress is not needed by force-only MD timing runs.  Keep
+            # the released model's default behaviour, while allowing callers
+            # such as the GPU-resident Opt1 route to skip this entire section.
+            if self.compute_stress or self.use_atomic_virial:
+                diag = rij * fij
+                s12 = rij[..., 0] * fij[..., 1]
+                s23 = rij[..., 1] * fij[..., 2]
+                s31 = rij[..., 2] * fij[..., 0]
+                _virial = torch.cat([
+                    diag,
+                    s12.unsqueeze(-1),
+                    s23.unsqueeze(-1),
+                    s31.unsqueeze(-1)
+                ], dim=-1)
 
-            _s = torch.zeros(tot_num, 6, dtype=fij.dtype, device=fij.device)
-            _edge_dst6 = broadcast(edge_idx[1], _virial, 0)
-            _s.scatter_reduce_(0, _edge_dst6, _virial, reduce='sum')
-            if self.use_atomic_virial:
-                data[self.key_atomic_virial] = torch.neg(_s)
+                _s = torch.zeros(tot_num, 6, dtype=fij.dtype, device=fij.device)
+                _edge_dst6 = broadcast(edge_idx[1], _virial, 0)
+                _s.scatter_reduce_(0, _edge_dst6, _virial, reduce='sum')
+                if self.use_atomic_virial:
+                    data[self.key_atomic_virial] = torch.neg(_s)
 
-            if self._is_batch_data:
-                batch = data[KEY.BATCH]  # for deploy, must be defined first
-                nbatch = int(batch.max().cpu().item()) + 1
-                sout = torch.zeros(
-                    (nbatch, 6), dtype=_virial.dtype, device=_virial.device
-                )
-                _batch = broadcast(batch, _s, 0)
-                sout.scatter_reduce_(0, _batch, _s, reduce='sum')
-            else:
-                sout = torch.sum(_s, dim=0)
+                if self.compute_stress:
+                    if self._is_batch_data:
+                        batch = data[KEY.BATCH]
+                        # One cell volume is stored per graph.  Its size is
+                        # available without reading a CUDA value on the host.
+                        nbatch = data[self.key_cell_volume].numel()
+                        sout = torch.zeros(
+                            (nbatch, 6),
+                            dtype=_virial.dtype,
+                            device=_virial.device,
+                        )
+                        _batch = broadcast(batch, _s, 0)
+                        sout.scatter_reduce_(0, _batch, _s, reduce='sum')
+                    else:
+                        sout = torch.sum(_s, dim=0)
 
-            volume = data[self.key_cell_volume]
-            vlim = 1e-3  # for cell volume = 0 for non PBC structures
-            if self._is_batch_data:
-                volume[volume < vlim] = vlim
-            elif volume < vlim:
-                volume = torch.tensor(
-                    vlim, dtype=volume.dtype, device=volume.device
-                )
-
-            data[self.key_stress] =\
-                torch.neg(sout) / volume.unsqueeze(-1)
+                    volume = torch.clamp_min(data[self.key_cell_volume], 1e-3)
+                    data[self.key_stress] = (
+                        torch.neg(sout) / volume.unsqueeze(-1)
+                    )
 
         return data

@@ -36,7 +36,7 @@ _FOURTH_ORDER_COEFFS = (
 class _ModelOutput:
     energy: torch.Tensor
     forces: torch.Tensor
-    stress: torch.Tensor
+    stress: torch.Tensor | None
 
 
 class _SingleSystemPotential:
@@ -48,7 +48,10 @@ class _SingleSystemPotential:
         *,
         device: torch.device,
         atomic_numbers: torch.Tensor,
+        cell: torch.Tensor,
+        pbc: torch.Tensor,
         modal: str | None,
+        compute_stress: bool,
     ) -> None:
         try:
             from torch_sim.neighbors import torchsim_nl
@@ -68,9 +71,12 @@ class _SingleSystemPotential:
         )
         if not model.type_map:
             raise ValueError('SevenNet checkpoint has no type map')
-        unknown = sorted(set(atomic_numbers.cpu().tolist()) - set(model.type_map))
+        atomic_numbers_host = atomic_numbers.cpu().tolist()
+        unknown = sorted(set(atomic_numbers_host) - set(model.type_map))
         if unknown:
-            raise ValueError(f'SevenNet checkpoint does not support atomic Z={unknown}')
+            raise ValueError(
+                f'SevenNet checkpoint does not support atomic Z={unknown}'
+            )
         if model.modal_map:
             if modal is None:
                 raise ValueError(
@@ -83,18 +89,58 @@ class _SingleSystemPotential:
                     f'{sorted(model.modal_map)}'
                 )
 
-        # A single-system graph avoids PyG Collater and the batch path's .item()
-        # synchronizations.  False here is model semantics, not an accelerator.
+        # A single-system graph avoids PyG Collater and its per-step container
+        # construction.  False here is model semantics, not an accelerator.
         model.set_is_batch_data(False)
-        model.eval_type_map = torch.tensor(True)
+        model.eval_type_map = False
+        force_output = model._modules.get('force_output')
+        if force_output is None or not hasattr(force_output, 'compute_stress'):
+            raise RuntimeError(
+                'SevenNet Opt1 requires a force_output module with the '
+                'compute_stress switch'
+            )
+        force_output.compute_stress = compute_stress
         self.model = model.to(device).eval()
         self.device = device
         self.atomic_numbers = atomic_numbers
+        self.type_indices = torch.tensor(
+            [model.type_map[z] for z in atomic_numbers_host],
+            dtype=torch.long,
+            device=device,
+        )
         self.modal = modal
+        self.compute_stress = compute_stress
         self.cutoff = float(model.cutoff)
         self.neighbor_list_fn = torchsim_nl
+        self.cell_batch = cell.unsqueeze(0)
+        self.pbc_batch = pbc.unsqueeze(0)
         self.system_idx = torch.zeros(
             atomic_numbers.shape[0], dtype=torch.long, device=device
+        )
+        self.model_positions = torch.empty(
+            atomic_numbers.shape[0], 3, dtype=torch.float32, device=device
+        )
+        self.model_cell = cell.to(torch.float32)
+        self.cell_volume = torch.det(self.model_cell)
+        self.num_atoms = torch.tensor(
+            atomic_numbers.shape[0], dtype=torch.long, device=device
+        )
+        empty_edge_index = torch.empty((2, 0), dtype=torch.long, device=device)
+        empty_shifts = torch.empty((0, 3), dtype=torch.float32, device=device)
+        self.graph = AtomGraphData(
+            x=self.type_indices,
+            edge_index=empty_edge_index,
+            pos=self.model_positions,
+            **{
+                key.ATOMIC_NUMBERS: atomic_numbers,
+                key.EDGE_VEC: empty_shifts,
+                key.CELL: self.model_cell,
+                key.CELL_SHIFT: empty_shifts,
+                key.CELL_VOLUME: self.cell_volume,
+                key.NUM_ATOMS: self.num_atoms,
+                key.DATA_MODALITY: modal,
+                key.INFO: {},
+            },
         )
         self.parameter_dtypes = sorted(
             {
@@ -106,52 +152,41 @@ class _SingleSystemPotential:
     def __call__(
         self,
         positions: torch.Tensor,
-        cell: torch.Tensor,
-        pbc: torch.Tensor,
     ) -> _ModelOutput:
         # Neighbor geometry is evaluated from the FP64 MD state.  SevenNet's
         # regular checkpoint interface consumes float32 geometry, matching its
         # ASE calculator; forces are converted back to FP64 for integration.
         edge_index, _mapping_system, unit_shifts = self.neighbor_list_fn(
             positions,
-            cell.unsqueeze(0),
-            pbc.unsqueeze(0),
+            self.cell_batch,
+            self.pbc_batch,
             self.cutoff,
             self.system_idx,
         )
-        model_positions = positions.to(torch.float32)
-        model_cell = cell.to(torch.float32)
+        self.model_positions.copy_(positions)
         model_shifts = unit_shifts.to(torch.float32)
-        shifts = torch.mm(model_shifts, model_cell)
+        shifts = torch.mm(model_shifts, self.model_cell)
         edge_vec = (
-            model_positions[edge_index[1]]
-            - model_positions[edge_index[0]]
+            self.model_positions[edge_index[1]]
+            - self.model_positions[edge_index[0]]
             + shifts
         )
-        graph = AtomGraphData(
-            x=self.atomic_numbers,
-            edge_index=edge_index,
-            pos=model_positions,
-            **{
-                key.ATOMIC_NUMBERS: self.atomic_numbers,
-                key.EDGE_VEC: edge_vec,
-                key.CELL: model_cell,
-                key.CELL_SHIFT: model_shifts,
-                key.CELL_VOLUME: torch.det(model_cell),
-                key.NUM_ATOMS: torch.tensor(
-                    self.atomic_numbers.shape[0],
-                    dtype=torch.long,
-                    device=self.device,
-                ),
-                key.DATA_MODALITY: self.modal,
-                key.INFO: {},
-            },
-        )
+        # Reuse the single-system graph container and every static tensor.  The
+        # SevenNet modules overwrite their intermediate fields in order, so
+        # retaining one container keeps only the immediately preceding graph.
+        self.graph[key.NODE_FEATURE] = self.type_indices
+        self.graph[key.EDGE_IDX] = edge_index
+        self.graph[key.POS] = self.model_positions
+        self.graph[key.EDGE_VEC] = edge_vec
+        self.graph[key.CELL_SHIFT] = model_shifts
         with torch.enable_grad():
-            output = self.model(graph)
+            output = self.model(self.graph)
+        required = [key.PRED_TOTAL_ENERGY, key.PRED_FORCE]
+        if self.compute_stress:
+            required.append(key.PRED_STRESS)
         missing = [
             name
-            for name in (key.PRED_TOTAL_ENERGY, key.PRED_FORCE, key.PRED_STRESS)
+            for name in required
             if name not in output or output[name] is None
         ]
         if missing:
@@ -159,12 +194,16 @@ class _SingleSystemPotential:
 
         # SevenNet stores stress as [xx, yy, zz, xy, yz, xz] with the opposite
         # sign to ASE.  Preserve SevenNetCalculator's exact conversion.
-        model_stress = output[key.PRED_STRESS]
-        ase_stress = -model_stress.reshape(-1)[[0, 1, 2, 4, 5, 3]]
+        ase_stress = None
+        if self.compute_stress:
+            model_stress = output[key.PRED_STRESS]
+            ase_stress = (
+                -model_stress.reshape(-1)[[0, 1, 2, 4, 5, 3]]
+            ).detach().to(torch.float64)
         return _ModelOutput(
             energy=output[key.PRED_TOTAL_ENERGY].sum().detach().to(torch.float64),
             forces=output[key.PRED_FORCE].detach().to(torch.float64),
-            stress=ase_stress.detach().to(torch.float64),
+            stress=ase_stress,
         )
 
 
@@ -304,12 +343,13 @@ def _frame(
     frame.positions = positions.detach().cpu().numpy()
     frame.set_momenta(momenta.detach().cpu().numpy())
     frame.info['md_step'] = step
-    frame.calc = SinglePointCalculator(
-        frame,
-        energy=float(output.energy.cpu()),
-        forces=output.forces.cpu().numpy(),
-        stress=output.stress.cpu().numpy(),
-    )
+    results = {
+        'energy': float(output.energy.cpu()),
+        'forces': output.forces.cpu().numpy(),
+    }
+    if output.stress is not None:
+        results['stress'] = output.stress.cpu().numpy()
+    frame.calc = SinglePointCalculator(frame, **results)
     return frame
 
 
@@ -350,7 +390,9 @@ def run_md(request):
     if not torch.cuda.is_available():
         raise RuntimeError('SevenNet opt1 requested CUDA, but CUDA is unavailable')
     if os.environ.get('TORCH_ALLOW_TF32_CUBLAS_OVERRIDE') == '1':
-        raise RuntimeError('SevenNet opt1 forbids TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1')
+        raise RuntimeError(
+            'SevenNet opt1 forbids TORCH_ALLOW_TF32_CUBLAS_OVERRIDE=1'
+        )
     if request.atoms.constraints:
         raise NotImplementedError('SevenNet opt1 does not support ASE constraints')
 
@@ -382,15 +424,21 @@ def run_md(request):
     atomic_numbers = torch.tensor(
         atoms.get_atomic_numbers(), device=device, dtype=torch.long
     )
+    compute_stress = bool(
+        config.collect_trajectory or request.options.get('compute_stress', False)
+    )
     potential = _SingleSystemPotential(
         request.model_path,
         device=device,
         atomic_numbers=atomic_numbers,
+        cell=cell,
+        pbc=pbc,
         modal=request.options.get('modal'),
+        compute_stress=compute_stress,
     )
 
     def force_fn(positions: torch.Tensor) -> _ModelOutput:
-        return potential(positions, cell, pbc)
+        return potential(positions)
 
     dt = config.timestep_fs * units.fs
     tau = config.thermostat_time_fs * units.fs
@@ -539,6 +587,7 @@ def run_md(request):
             'cuda_graph': False,
             'tensor_product_accelerator': None,
             'model_specific_fusion': False,
+            'compute_stress': compute_stress,
             'modal': request.options.get('modal'),
             'trajectory_includes_step_zero': config.collect_trajectory,
         },
