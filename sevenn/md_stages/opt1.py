@@ -21,6 +21,11 @@ import torch
 from ase import Atoms, units
 from ase.calculators.singlepoint import SinglePointCalculator
 
+from md_benchmark.performance import (
+    CudaPhaseProfiler,
+    performance_profile_requested,
+)
+
 import sevenn._keys as key
 from sevenn.atom_graph_data import AtomGraphData
 
@@ -52,6 +57,7 @@ class _SingleSystemPotential:
         pbc: torch.Tensor,
         modal: str | None,
         compute_stress: bool,
+        profiler: CudaPhaseProfiler,
     ) -> None:
         try:
             from torch_sim.neighbors import torchsim_nl
@@ -110,6 +116,7 @@ class _SingleSystemPotential:
         )
         self.modal = modal
         self.compute_stress = compute_stress
+        self.profiler = profiler
         self.cutoff = float(model.cutoff)
         self.neighbor_list_fn = torchsim_nl
         self.cell_batch = cell.unsqueeze(0)
@@ -156,21 +163,23 @@ class _SingleSystemPotential:
         # Neighbor geometry is evaluated from the FP64 MD state.  SevenNet's
         # regular checkpoint interface consumes float32 geometry, matching its
         # ASE calculator; forces are converted back to FP64 for integration.
-        edge_index, _mapping_system, unit_shifts = self.neighbor_list_fn(
-            positions,
-            self.cell_batch,
-            self.pbc_batch,
-            self.cutoff,
-            self.system_idx,
-        )
-        self.model_positions.copy_(positions)
-        model_shifts = unit_shifts.to(torch.float32)
-        shifts = torch.mm(model_shifts, self.model_cell)
-        edge_vec = (
-            self.model_positions[edge_index[1]]
-            - self.model_positions[edge_index[0]]
-            + shifts
-        )
+        with self.profiler.phase('neighbor_list'):
+            edge_index, _mapping_system, unit_shifts = self.neighbor_list_fn(
+                positions,
+                self.cell_batch,
+                self.pbc_batch,
+                self.cutoff,
+                self.system_idx,
+            )
+        with self.profiler.phase('model_input'):
+            self.model_positions.copy_(positions)
+            model_shifts = unit_shifts.to(torch.float32)
+            shifts = torch.mm(model_shifts, self.model_cell)
+            edge_vec = (
+                self.model_positions[edge_index[1]]
+                - self.model_positions[edge_index[0]]
+                + shifts
+            )
         # Reuse the single-system graph container and every static tensor.  The
         # SevenNet modules overwrite their intermediate fields in order, so
         # retaining one container keeps only the immediately preceding graph.
@@ -179,8 +188,9 @@ class _SingleSystemPotential:
         self.graph[key.POS] = self.model_positions
         self.graph[key.EDGE_VEC] = edge_vec
         self.graph[key.CELL_SHIFT] = model_shifts
-        with torch.enable_grad():
-            output = self.model(self.graph)
+        with self.profiler.phase('model_energy_force'):
+            with torch.enable_grad():
+                output = self.model(self.graph)
         required = [key.PRED_TOTAL_ENERGY, key.PRED_FORCE]
         if self.compute_stress:
             required.append(key.PRED_STRESS)
@@ -427,6 +437,10 @@ def run_md(request):
     compute_stress = bool(
         config.collect_trajectory or request.options.get('compute_stress', False)
     )
+    profiler = CudaPhaseProfiler(
+        enabled=performance_profile_requested(request.options),
+        device=device,
+    )
     potential = _SingleSystemPotential(
         request.model_path,
         device=device,
@@ -435,6 +449,7 @@ def run_md(request):
         pbc=pbc,
         modal=request.options.get('modal'),
         compute_stress=compute_stress,
+        profiler=profiler,
     )
 
     def force_fn(positions: torch.Tensor) -> _ModelOutput:
@@ -508,8 +523,10 @@ def run_md(request):
 
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
+    profiler.start()
     started = time.perf_counter()
-    output = force_fn(positions)
+    with profiler.phase('initial_force'):
+        output = force_fn(positions)
 
     def record_frame(step: int) -> None:
         frame = _frame(
@@ -529,9 +546,10 @@ def run_md(request):
     if config.collect_trajectory:
         record_frame(0)
     for step in range(1, config.steps + 1):
-        positions, momenta, output = advance(
-            positions, momenta, output, thermostat
-        )
+        with profiler.phase('md_step'):
+            positions, momenta, output = advance(
+                positions, momenta, output, thermostat
+            )
         if config.collect_statistics and step in observation_steps:
             observations.append(
                 MDObservation(
@@ -547,7 +565,9 @@ def run_md(request):
         if config.collect_trajectory and step % config.record_interval == 0:
             record_frame(step)
     torch.cuda.synchronize(device)
+    profiler.stop()
     elapsed = time.perf_counter() - started
+    performance_profile = profiler.summary(synchronize=False)
     peak_memory = torch.cuda.max_memory_allocated(device) / 1e9
 
     if target_path is not None:
@@ -588,6 +608,7 @@ def run_md(request):
             'tensor_product_accelerator': None,
             'model_specific_fusion': False,
             'compute_stress': compute_stress,
+            'performance_profile': performance_profile,
             'modal': request.options.get('modal'),
             'trajectory_includes_step_zero': config.collect_trajectory,
         },
