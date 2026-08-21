@@ -57,7 +57,7 @@ class _SingleSystemPotential:
         pbc: torch.Tensor,
         modal: str | None,
         compute_stress: bool,
-        profiler: CudaPhaseProfiler,
+        profiler: CudaPhaseProfiler | None = None,
     ) -> None:
         try:
             from torch_sim.neighbors import torchsim_nl
@@ -116,7 +116,10 @@ class _SingleSystemPotential:
         )
         self.modal = modal
         self.compute_stress = compute_stress
-        self.profiler = profiler
+        self.profiler = profiler or CudaPhaseProfiler(
+            enabled=False,
+            device=device,
+        )
         self.cutoff = float(model.cutoff)
         self.neighbor_list_fn = torchsim_nl
         self.cell_batch = cell.unsqueeze(0)
