@@ -109,6 +109,8 @@ def test_model_only_replay_reuses_static_outputs() -> None:
         torch.zeros((2, 3)),
     )
     potential._staticize = lambda *_args: 2
+    potential._input_addresses = lambda: (11, 12, 13, 14, 15)
+    potential._capture_input_addresses = (11, 12, 13, 14, 15)
     potential.profiler = SimpleNamespace(
         phase=lambda _name: contextlib.nullcontext()
     )

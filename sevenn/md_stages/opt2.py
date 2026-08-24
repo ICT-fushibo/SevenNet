@@ -20,24 +20,23 @@ from pathlib import Path
 import numpy as np
 import torch
 from ase import units
-from torch import nn
-
 from md_benchmark.performance import (
     CudaPhaseProfiler,
     performance_profile_requested,
 )
+from torch import nn
 
 import sevenn._keys as key
 from sevenn.atom_graph_data import AtomGraphData
 from sevenn.md_stages.opt1 import (
-    _ModelOutput,
-    _NoseHooverChain,
-    _SingleSystemPotential,
     _berendsen_step,
     _configure_output,
     _frame,
     _initial_momenta,
+    _ModelOutput,
     _nhc_step,
+    _NoseHooverChain,
+    _SingleSystemPotential,
 )
 
 
