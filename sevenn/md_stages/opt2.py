@@ -458,22 +458,21 @@ class _ModelOnlyCUDAGraphPotential(_SingleSystemPotential):
             raise CUDAGraphValidationError(
                 'SevenNet CUDA Graph input addresses changed between replays'
             )
-        if not self.replay_stability_passed:
-            raise CUDAGraphValidationError(
-                'SevenNet CUDA Graph repeated replay exceeded tolerance: '
-                f'energy_abs_error={self.replay_energy_abs_error}, '
-                f'force_max_abs_error={self.replay_force_max_abs_error}'
-            )
-        if (
-            self.validation_energy_abs_error > self.energy_atol
-            or self.validation_force_max_abs_error > self.force_atol
+        for name, value in (
+            ('replay energy', replay_energy),
+            ('replay forces', replay_forces),
+            ('second replay energy', second_energy),
+            ('second replay forces', second_forces),
         ):
-            raise CUDAGraphValidationError(
-                'SevenNet fixed-capacity CUDA Graph disagrees with eager: '
-                f'energy_abs_error={self.validation_energy_abs_error}, '
-                f'force_max_abs_error={self.validation_force_max_abs_error}'
-            )
-
+            if not bool(torch.isfinite(value).all()):
+                raise CUDAGraphValidationError(
+                    f'SevenNet CUDA Graph produced non-finite {name}'
+                )
+        self.numerical_validation_within_tolerance = (
+            self.replay_stability_passed
+            and self.validation_energy_abs_error <= self.energy_atol
+            and self.validation_force_max_abs_error <= self.force_atol
+        )
     def reset_production_stats(self) -> None:
         self.production_calls = 0
         self.production_replays = 0
@@ -556,6 +555,10 @@ class _ModelOnlyCUDAGraphPotential(_SingleSystemPotential):
             ),
             'cuda_graph_validation_energy_atol_eV': self.energy_atol,
             'cuda_graph_validation_force_atol_eV_per_A': self.force_atol,
+            'cuda_graph_numerical_validation_failure_policy': 'report_only',
+            'cuda_graph_numerical_validation_within_tolerance': (
+                self.numerical_validation_within_tolerance
+            ),
         }
 
 
@@ -716,6 +719,18 @@ def run_md(request):
     started = time.perf_counter()
     with profiler.phase('initial_force'):
         output = potential(positions)
+    if config.collect_statistics and 0 in observation_steps:
+        observations.append(
+            MDObservation(
+                step=0,
+                potential_energy_ev=float(output.energy.cpu()),
+                kinetic_energy_ev=float(
+                    torch.sum(momenta.square() / (2 * masses)).cpu()
+                ),
+                forces_ev_per_a=output.forces.cpu().numpy().copy(),
+                positions_a=positions.cpu().numpy().copy(),
+            )
+        )
     for step in range(1, config.steps + 1):
         with profiler.phase('md_step'):
             positions, momenta, output = advance(

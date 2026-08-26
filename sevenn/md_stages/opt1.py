@@ -548,6 +548,18 @@ def run_md(request):
     # ASE Dynamics invokes attached trajectory observers at nsteps=0.
     if config.collect_trajectory:
         record_frame(0)
+    if config.collect_statistics and 0 in observation_steps:
+        observations.append(
+            MDObservation(
+                step=0,
+                potential_energy_ev=float(output.energy.cpu()),
+                kinetic_energy_ev=float(
+                    torch.sum(momenta.square() / (2 * masses)).cpu()
+                ),
+                forces_ev_per_a=output.forces.cpu().numpy().copy(),
+                positions_a=positions.cpu().numpy().copy(),
+            )
+        )
     for step in range(1, config.steps + 1):
         with profiler.phase('md_step'):
             positions, momenta, output = advance(
