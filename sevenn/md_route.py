@@ -25,7 +25,6 @@ from md_benchmark.md_route import (
     run_optimized_stage,
 )
 
-
 _ACCELERATOR_ENV = (
     'SEVENNET_ENABLE_CUEQ',
     'SEVENNET_ENABLE_FLASH',

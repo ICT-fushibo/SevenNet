@@ -11,6 +11,7 @@ from sevenn.md_stages.opt2 import (
     CUDAGraphCapacityError,
     _ModelOnlyCUDAGraphPotential,
     _RealAtomReduce,
+    _maximum_neighbors_per_atom,
     edge_capacity_from_probe,
     run_md,
     staticize_edges_,
@@ -20,6 +21,13 @@ from sevenn.md_stages.opt2 import (
 def test_edge_capacity_rounds_with_margin() -> None:
     assert edge_capacity_from_probe(100, margin=0.25, edge_step=64) == 128
     assert edge_capacity_from_probe(128, margin=0.0, edge_step=128) == 256
+
+
+def test_probe_maximum_neighbors_uses_sevennet_centre_axis() -> None:
+    edge_index = torch.tensor(
+        [[0, 0, 1, 2, 2, 2], [1, 2, 0, 0, 1, 3]], dtype=torch.long
+    )
+    assert _maximum_neighbors_per_atom(edge_index, num_atoms=4) == 3
 
 
 def test_staticize_edges_keeps_fixed_addresses_and_isolates_padding() -> None:
@@ -101,6 +109,9 @@ def test_model_only_replay_reuses_static_outputs() -> None:
     potential.total_replays = 0
     potential.min_real_edges = None
     potential.max_real_edges = None
+    potential.initial_max_neighbors_per_atom = None
+    potential.max_neighbors_per_atom = None
+    potential.track_neighbor_capacity = False
     potential.static_forces = torch.arange(6, dtype=torch.float32).reshape(2, 3)
     potential.static_energy = torch.tensor(-3.0)
     potential._build_real_inputs = lambda _positions: (

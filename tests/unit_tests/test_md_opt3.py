@@ -25,11 +25,10 @@ def test_neighbor_capacity_uses_esen_cap_rounding() -> None:
     assert neighbor_capacity_from_probe(48, margin=0.0, slot_step=8) == 56
 
 
-def test_total_capacity_conversion_adds_aligned_guard_bucket() -> None:
-    # ceil(2816 / 32) = 88, already aligned, plus one 8-neighbor guard.
-    assert _guarded_uniform_capacity_from_total(2816, 32) == 96
-    # ceil(100 / 3) = 34, align to 40, then add the guard => 48.
-    assert _guarded_uniform_capacity_from_total(100, 3) == 48
+def test_guarded_total_capacity_is_aligned_without_a_second_guard() -> None:
+    # The Opt2 total-edge probe already includes factor/headroom.
+    assert _guarded_uniform_capacity_from_total(2816, 32) == 88
+    assert _guarded_uniform_capacity_from_total(100, 3) == 40
 
 
 def test_fixed_builder_preserves_real_edges_and_distributes_sinks() -> None:

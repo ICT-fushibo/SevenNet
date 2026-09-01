@@ -236,7 +236,11 @@ class FixedShapeSevenNetNeighborBuilder:
         # neighbors at the boundary of the selected maximum.
         selection_k = min(self.max_neighbors + 1, self.candidates_per_atom)
         nearest = torch.topk(
-            torch.where(valid, distance_sqr, torch.full_like(distance_sqr, torch.inf)),
+            torch.where(
+                valid,
+                distance_sqr,
+                torch.full_like(distance_sqr, torch.inf),
+            ),
             k=selection_k,
             dim=1,
             largest=False,

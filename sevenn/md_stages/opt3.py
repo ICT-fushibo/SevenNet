@@ -19,7 +19,6 @@ from pathlib import Path
 import numpy as np
 import torch
 from ase import units
-
 from md_benchmark.performance import (
     CudaPhaseProfiler,
     performance_profile_requested,
@@ -60,9 +59,9 @@ def _guarded_uniform_capacity_from_total(
     num_atoms: int,
     *,
     slot_step: int = 8,
-    guard_slots: int = 1,
+    guard_slots: int = 0,
 ) -> int:
-    """Convert total-edge CAP to guarded, aligned per-centre slots."""
+    """Convert an already guarded total-edge CAP to aligned centre slots."""
 
     if total_capacity < 1 or num_atoms < 1:
         raise ValueError('total_capacity and num_atoms must be positive')
@@ -715,6 +714,7 @@ def run_md(request):
         ),
         edge_margin=float(request.options.get('cuda_graph_edge_margin', 0.10)),
         edge_step=int(request.options.get('cuda_graph_edge_step', 8)),
+        track_neighbor_capacity=False,
         capture_warmup=capture_warmup,
         energy_atol=energy_atol,
         force_atol=force_atol,
@@ -736,6 +736,7 @@ def run_md(request):
     explicit_neighbors = request.options.get('cuda_graph_neighbors_per_atom')
     if explicit_neighbors is not None:
         neighbors_per_atom = int(explicit_neighbors)
+        capacity_source = 'trajectory-per-atom-probe'
     else:
         total_floor = 0
         if requested_total is not None:
@@ -743,9 +744,10 @@ def run_md(request):
                 int(requested_total),
                 len(atoms),
                 slot_step=8,
-                guard_slots=1,
+                guard_slots=0,
             )
         neighbors_per_atom = max(inferred_capacity, total_floor)
+        capacity_source = 'total-edge-plus-initial-per-atom'
     if neighbors_per_atom < initial_maximum:
         raise CUDAGraphCapacityError(initial_maximum, neighbors_per_atom)
     edge_capacity = len(atoms) * neighbors_per_atom
@@ -877,6 +879,8 @@ def run_md(request):
             'cuda_graph_neighbor_build_outside': False,
             'fixed_edge_capacity': True,
             'capacity_policy': 'esen-uniform-cap',
+            'capacity_source': capacity_source,
+            'capacity_total_to_per_atom_guard_slots': 0,
             'initial_probe_max_neighbors': initial_maximum,
             'dummy_padding': True,
             'sink_padding': 'distributed-dummy-bank',
