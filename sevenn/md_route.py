@@ -5,6 +5,10 @@ reference: the regular SevenNet/e3nn ASE calculator, its normal CPU matscipy
 neighbor list, float32 model arithmetic, and no tensor-product accelerator.
 The ``cueq``, ``flash``, and ``oeq`` backends are retained only as explicit
 comparators for accelerators that already exist upstream.
+
+All non-baseline stages use the permanent dynamic dispatch convention.  Thus
+``stage=opt3`` resolves to ``sevenn.md_stages.opt3.run_md`` and its
+``whole-step-cuda-graph`` backend without changing baseline/Opt1/Opt2 behavior.
 """
 
 from __future__ import annotations
