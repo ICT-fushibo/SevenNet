@@ -733,9 +733,6 @@ def run_md(request):
         edge_step=int(request.options.get('cuda_graph_edge_step', 8)),
         track_neighbor_capacity=False,
         capture_warmup=capture_warmup,
-        verlet_rebuild_interval=int(
-            request.options.get('verlet_rebuild_interval', 0)
-        ),
         energy_atol=energy_atol,
         force_atol=force_atol,
         dummy_atoms=int(request.options.get('cuda_graph_dummy_atoms', 32)),
@@ -826,6 +823,9 @@ def run_md(request):
         dt=config.timestep_fs * units.fs,
         tau=config.thermostat_time_fs * units.fs,
         capture_warmup=capture_warmup,
+        verlet_rebuild_interval=int(
+            request.options.get('verlet_rebuild_interval', 0)
+        ),
         eager_reference=eager_reference,
         energy_atol=energy_atol,
         force_atol=force_atol,
