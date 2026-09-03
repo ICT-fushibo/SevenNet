@@ -2,7 +2,7 @@
 
 One replay contains the NVT integrator, fixed-shape CUDA neighbor construction,
 SevenNet forward/conservative-force path, and the persistent MD-state update.
-The implementation uses eSEN's uniform per-centre CAP policy and distributed
+The implementation uses eSEN's per-centre CAP policy and distributed
 dummy sink padding.  Capacity overflow is recorded on device and fails closed
 at the next reporting/final synchronization point.  Transaction rollback and
 multiple graph buckets are intentionally deferred.
@@ -19,6 +19,10 @@ from pathlib import Path
 import numpy as np
 import torch
 from ase import units
+from md_benchmark.neighbor_utils import (
+    capacities_from_counts,
+    normalize_neighbor_capacities,
+)
 from md_benchmark.performance import (
     CudaPhaseProfiler,
     performance_profile_requested,
@@ -236,6 +240,7 @@ class _SevenNetWholeStepGraph:
         dt: float,
         tau: float,
         capture_warmup: int,
+        verlet_rebuild_interval: int,
         eager_reference: _ModelOutput,
         energy_atol: float,
         force_atol: float,
@@ -255,6 +260,11 @@ class _SevenNetWholeStepGraph:
         self.dt = float(dt)
         self.tau = float(tau)
         self.capture_warmup = int(capture_warmup)
+        self.verlet_rebuild_interval = int(verlet_rebuild_interval)
+        if self.verlet_rebuild_interval < 0:
+            raise ValueError('verlet_rebuild_interval must be non-negative')
+        if self.builder.verlet_skin <= 0:
+            self.verlet_rebuild_interval = 0
         self.advance = torch.zeros((), device=self.device, dtype=torch.float64)
         self.step_counter = torch.zeros((), device=self.device, dtype=torch.long)
         self.thermostat: _NoseHooverChain | None = None
@@ -547,6 +557,7 @@ class _SevenNetWholeStepGraph:
             raise RuntimeError('Capture must complete before production')
         self.restore_initial_()
         self.builder.reset_stats()
+        self.builder.initialize_skin(self.positions)
         self.production_replays = 0
 
     def evaluate_initial(self) -> _ModelOutput:
@@ -562,6 +573,11 @@ class _SevenNetWholeStepGraph:
     def step(self) -> _ModelOutput:
         if self.graph is None:
             raise RuntimeError('Capture must complete before replay')
+        if (
+            self.verlet_rebuild_interval
+            and self.production_replays % self.verlet_rebuild_interval == 0
+        ):
+            self.builder.initialize_skin(self.positions)
         self.graph.replay()
         self.production_replays += 1
         self.total_replays += 1
@@ -609,6 +625,7 @@ class _SevenNetWholeStepGraph:
             ],
             'cuda_graph_dummy_atoms': self.potential.dummy_atoms,
             'cuda_graph_capture_warmup': self.capture_warmup,
+            'verlet_rebuild_interval': self.verlet_rebuild_interval,
             'cuda_graph_capture_wall_time_s': self.capture_wall_time_s,
             'cuda_graph_replay_output_addresses_stable': (
                 self.output_addresses_stable
@@ -716,6 +733,9 @@ def run_md(request):
         edge_step=int(request.options.get('cuda_graph_edge_step', 8)),
         track_neighbor_capacity=False,
         capture_warmup=capture_warmup,
+        verlet_rebuild_interval=int(
+            request.options.get('verlet_rebuild_interval', 0)
+        ),
         energy_atol=energy_atol,
         force_atol=force_atol,
         dummy_atoms=int(request.options.get('cuda_graph_dummy_atoms', 32)),
@@ -748,9 +768,31 @@ def run_md(request):
             )
         neighbors_per_atom = max(inferred_capacity, total_floor)
         capacity_source = 'total-edge-plus-initial-per-atom'
-    if neighbors_per_atom < initial_maximum:
-        raise CUDAGraphCapacityError(initial_maximum, neighbors_per_atom)
-    edge_capacity = len(atoms) * neighbors_per_atom
+    initial_counts = torch.bincount(initial_index[0], minlength=len(atoms))[: len(atoms)]
+    explicit_caps = request.options.get('neighbor_capacities')
+    if explicit_caps is None and request.options.get('per_atom_cap', False):
+        capacities = capacities_from_counts(
+            initial_counts,
+            factor=float(request.options.get('cuda_graph_neighbor_margin', 0.10)) + 1.0,
+            headroom=1,
+            alignment=int(request.options.get('cuda_graph_neighbor_step', 8)),
+        )
+    else:
+        capacities = normalize_neighbor_capacities(
+            explicit_caps,
+            num_atoms=len(atoms),
+            default=neighbors_per_atom,
+        )
+    initial_capacity_excess = torch.clamp_min(
+        initial_counts - torch.as_tensor(capacities, device=device), 0
+    )
+    if bool(initial_capacity_excess.max().item() > 0):
+        raise CUDAGraphCapacityError(
+            int(initial_counts.max().item()), int(max(capacities))
+        )
+    edge_capacity = int(sum(capacities))
+    if explicit_caps is None and request.options.get('per_atom_cap', False):
+        capacity_source = 'initial-per-atom-cap-vector'
     potential._initialize_static_graph(edge_capacity)
     assert potential.static_edge_index is not None
     assert potential.static_cell_shifts is not None
@@ -760,7 +802,10 @@ def run_md(request):
         pbc=pbc,
         cutoff=potential.cutoff,
         neighbors_per_atom=neighbors_per_atom,
+        neighbor_capacities=capacities,
         dummy_atoms=potential.dummy_atoms,
+        verlet_skin=float(request.options.get('verlet_skin', 0.0)),
+        verlet_candidate_capacity=request.options.get('verlet_candidate_capacity'),
         max_neighbors=int(request.options.get('cuda_graph_max_neighbors', 300)),
         degeneracy_tolerance=float(
             request.options.get('cuda_graph_degeneracy_tolerance', 0.01)
@@ -768,6 +813,7 @@ def run_md(request):
         output_edge_index=potential.static_edge_index,
         output_cell_offsets=potential.static_cell_shifts,
     )
+    builder.initialize_skin(positions0)
 
     graph_md = _SevenNetWholeStepGraph(
         potential,
@@ -878,7 +924,12 @@ def run_md(request):
             'cuda_graph_neighbor_build_inside': True,
             'cuda_graph_neighbor_build_outside': False,
             'fixed_edge_capacity': True,
-            'capacity_policy': 'esen-uniform-cap',
+            'capacity_policy': (
+                'esen-per-atom-cap'
+                if len(set(capacities)) > 1
+                else 'esen-uniform-cap'
+            ),
+            'neighbor_capacities': capacities,
             'capacity_source': capacity_source,
             'capacity_total_to_per_atom_guard_slots': 0,
             'initial_probe_max_neighbors': initial_maximum,

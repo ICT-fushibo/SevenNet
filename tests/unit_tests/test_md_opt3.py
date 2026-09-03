@@ -52,6 +52,30 @@ def test_fixed_builder_preserves_real_edges_and_distributes_sinks() -> None:
     assert bool((offsets[[1, 3]].abs().sum(dim=1) > 0).all())
 
 
+def test_skin_builder_matches_full_search_with_per_atom_cap() -> None:
+    positions = torch.tensor([[0.1, 0.0, 0.0], [4.8, 0.0, 0.0]])
+    options = dict(
+        num_atoms=2,
+        cell=torch.eye(3) * 5.0,
+        pbc=torch.ones(3, dtype=torch.bool),
+        cutoff=1.0,
+        neighbors_per_atom=2,
+        neighbor_capacities=[1, 2],
+        dummy_atoms=2,
+    )
+    full = FixedShapeSevenNetNeighborBuilder(**options)
+    skin = FixedShapeSevenNetNeighborBuilder(
+        **options, verlet_skin=0.5, verlet_candidate_capacity=4
+    )
+    skin.initialize_skin(positions)
+
+    full_index, full_offsets = full.build(positions)
+    skin_index, skin_offsets = skin.build(positions)
+    torch.testing.assert_close(skin_index, full_index)
+    torch.testing.assert_close(skin_offsets, full_offsets)
+    assert skin.edge_capacity == 3
+
+
 def test_fixed_builder_records_per_centre_overflow_without_host_branch() -> None:
     builder = FixedShapeSevenNetNeighborBuilder(
         num_atoms=3,

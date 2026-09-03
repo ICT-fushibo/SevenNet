@@ -9,9 +9,9 @@ import torch
 
 from sevenn.md_stages.opt2 import (
     CUDAGraphCapacityError,
+    _maximum_neighbors_per_atom,
     _ModelOnlyCUDAGraphPotential,
     _RealAtomReduce,
-    _maximum_neighbors_per_atom,
     edge_capacity_from_probe,
     run_md,
     staticize_edges_,
