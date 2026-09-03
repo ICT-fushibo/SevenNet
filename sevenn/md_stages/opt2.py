@@ -250,8 +250,8 @@ class _ModelOnlyCUDAGraphPotential(_SingleSystemPotential):
         self.max_real_edges: int | None = None
         self.initial_max_neighbors_per_atom: int | None = None
         self.max_neighbors_per_atom: int | None = None
-        self.initial_neighbors_by_atom: list[int] | None = None
-        self.max_neighbors_by_atom: list[int] | None = None
+        self.initial_neighbors_by_atom: torch.Tensor | None = None
+        self.max_neighbors_by_atom: torch.Tensor | None = None
         self.output_addresses_stable = False
         self.input_addresses_stable = False
         self._capture_input_addresses: tuple[int, ...] | None = None
@@ -403,8 +403,8 @@ class _ModelOnlyCUDAGraphPotential(_SingleSystemPotential):
             )
             self.max_neighbors_per_atom = self.initial_max_neighbors_per_atom
             counts = torch.bincount(edge_index[0], minlength=self.n_real)[: self.n_real]
-            self.initial_neighbors_by_atom = counts.detach().cpu().tolist()
-            self.max_neighbors_by_atom = list(self.initial_neighbors_by_atom)
+            self.initial_neighbors_by_atom = counts.detach().clone()
+            self.max_neighbors_by_atom = counts.detach().clone()
         capacity = self.requested_edge_capacity or edge_capacity_from_probe(
             probed_edges,
             margin=self.edge_margin,
@@ -511,11 +511,12 @@ class _ModelOnlyCUDAGraphPotential(_SingleSystemPotential):
         self.min_real_edges = None
         self.max_real_edges = None
         self.max_neighbors_per_atom = self.initial_max_neighbors_per_atom
-        self.max_neighbors_by_atom = (
-            None
-            if self.initial_neighbors_by_atom is None
-            else list(self.initial_neighbors_by_atom)
-        )
+        if self.initial_neighbors_by_atom is None:
+            self.max_neighbors_by_atom = None
+        elif self.max_neighbors_by_atom is None:
+            self.max_neighbors_by_atom = self.initial_neighbors_by_atom.clone()
+        else:
+            self.max_neighbors_by_atom.copy_(self.initial_neighbors_by_atom)
 
     def __call__(self, positions: torch.Tensor) -> _ModelOutput:
         if not self.captured or self.cuda_graph is None:
@@ -533,11 +534,10 @@ class _ModelOnlyCUDAGraphPotential(_SingleSystemPotential):
                 else max(self.max_neighbors_per_atom, maximum)
             )
             counts = torch.bincount(edge_index[0], minlength=self.n_real)[: self.n_real]
-            values = counts.detach().cpu().tolist()
-            self.max_neighbors_by_atom = [
-                max(old, new)
-                for old, new in zip(self.max_neighbors_by_atom or values, values)
-            ]
+            assert self.max_neighbors_by_atom is not None
+            self.max_neighbors_by_atom.copy_(
+                torch.maximum(self.max_neighbors_by_atom, counts)
+            )
         self.production_calls += 1
         if num_edges > self.edge_capacity:
             self.capacity_misses += 1
@@ -587,7 +587,13 @@ class _ModelOnlyCUDAGraphPotential(_SingleSystemPotential):
             'cuda_graph_min_real_edges': self.min_real_edges,
             'cuda_graph_max_real_edges': self.max_real_edges,
             'cuda_graph_max_neighbors_per_atom': self.max_neighbors_per_atom,
-            'cuda_graph_maximum_neighbors_by_atom': self.max_neighbors_by_atom,
+            'cuda_graph_maximum_neighbors_by_atom': (
+                None
+                if self.max_neighbors_by_atom is None
+                else self.max_neighbors_by_atom.detach()
+                .to(device='cpu')
+                .tolist()
+            ),
             'capacity_probe_collect_per_atom': self.track_neighbor_capacity,
             'cuda_graph_dummy_atoms': 1,
             'cuda_graph_capture_warmup': self.capture_warmup,
