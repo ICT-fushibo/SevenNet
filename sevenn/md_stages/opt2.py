@@ -179,6 +179,7 @@ class _ModelOnlyCUDAGraphPotential(_SingleSystemPotential):
         capture_warmup: int,
         energy_atol: float,
         force_atol: float,
+        enable_cueq: bool = False,
     ) -> None:
         super().__init__(
             model_path,
@@ -189,6 +190,7 @@ class _ModelOnlyCUDAGraphPotential(_SingleSystemPotential):
             modal=modal,
             compute_stress=False,
             profiler=profiler,
+            enable_cueq=enable_cueq,
         )
         if requested_edge_capacity is not None and requested_edge_capacity < 1:
             raise ValueError('cuda_graph_edge_capacity must be positive')

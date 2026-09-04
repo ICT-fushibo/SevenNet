@@ -732,6 +732,7 @@ def run_md(request):
         edge_margin=float(request.options.get('cuda_graph_edge_margin', 0.10)),
         edge_step=int(request.options.get('cuda_graph_edge_step', 8)),
         track_neighbor_capacity=False,
+        enable_cueq=bool(request.options.get('_opt4_enable_cueq', False)),
         capture_warmup=capture_warmup,
         energy_atol=energy_atol,
         force_atol=force_atol,
@@ -939,8 +940,10 @@ def run_md(request):
             'transaction_rollback': False,
             'capacity_overflow_policy': 'raise-after-sync-no-fallback',
             'cuda_graph_buckets': 1,
-            'tensor_product_accelerator': None,
-            'model_specific_fusion': False,
+            'tensor_product_accelerator': (
+                'cuequivariance' if potential.enable_cueq else None
+            ),
+            'model_specific_fusion': bool(potential.enable_cueq),
             'compute_stress': False,
             'performance_profile': performance_profile,
             'modal': request.options.get('modal'),

@@ -58,6 +58,7 @@ class _SingleSystemPotential:
         modal: str | None,
         compute_stress: bool,
         profiler: CudaPhaseProfiler | None = None,
+        enable_cueq: bool = False,
     ) -> None:
         try:
             from torch_sim.neighbors import torchsim_nl
@@ -70,11 +71,18 @@ class _SingleSystemPotential:
         from sevenn.util import load_checkpoint
 
         checkpoint = load_checkpoint(model_path)
-        model = checkpoint.build_model(
-            enable_cueq=False,
-            enable_flash=False,
-            enable_oeq=False,
-        )
+        try:
+            model = checkpoint.build_model(
+                enable_cueq=bool(enable_cueq),
+                enable_flash=False,
+                enable_oeq=False,
+            )
+        except Exception as exc:
+            if enable_cueq:
+                raise RuntimeError(
+                    "SevenNet Opt4 cuEquivariance fusion could not be enabled"
+                ) from exc
+            raise
         if not model.type_map:
             raise ValueError('SevenNet checkpoint has no type map')
         atomic_numbers_host = atomic_numbers.cpu().tolist()
@@ -116,6 +124,7 @@ class _SingleSystemPotential:
         )
         self.modal = modal
         self.compute_stress = compute_stress
+        self.enable_cueq = bool(enable_cueq)
         self.profiler = profiler or CudaPhaseProfiler(
             enabled=False,
             device=device,
