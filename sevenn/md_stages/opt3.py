@@ -23,6 +23,12 @@ from md_benchmark.neighbor_utils import (
     capacities_from_counts,
     normalize_neighbor_capacities,
 )
+from md_benchmark.opt3_profile import (
+    model_nvtx_ranges,
+    nvtx_stage,
+    nvtx_steps,
+    profile_opt3,
+)
 from md_benchmark.performance import (
     CudaPhaseProfiler,
     performance_profile_requested,
@@ -139,6 +145,7 @@ class _WholeStepPotential(_ModelOnlyCUDAGraphPotential):
         )
 
     @torch.no_grad()
+    @nvtx_stage('neighbor_geometry')
     def write_geometry_(
         self,
         positions: torch.Tensor,
@@ -330,6 +337,7 @@ class _SevenNetWholeStepGraph:
         positions = self.positions + self.dt * half / self.masses
         return half, positions
 
+    @nvtx_stage('integrator_thermostat')
     def _graph_body(self) -> None:
         old_positions = self.positions
         old_momenta = self.momenta
@@ -358,7 +366,8 @@ class _SevenNetWholeStepGraph:
             self.builder,
             step=graph_step,
         )
-        model_forces, model_energy = self.potential._static_forward()
+        with model_nvtx_ranges(self.potential.model):
+            model_forces, model_energy = self.potential._static_forward()
         forces = model_forces.to(torch.float64)
         half_momenta = half_momenta + 0.5 * self.dt * forces
         if self.integrator_name == 'berendsen':
@@ -652,6 +661,7 @@ class _SevenNetWholeStepGraph:
         }
 
 
+@profile_opt3
 def run_md(request):
     """Run SevenNet Opt3 under the shared MD contract."""
 
@@ -709,7 +719,9 @@ def run_md(request):
         atoms.get_atomic_numbers(), device=device, dtype=torch.long
     )
     profiler = CudaPhaseProfiler(
-        enabled=performance_profile_requested(request.options), device=device
+        enabled=performance_profile_requested(request.options),
+        device=device,
+        prefix='opt3',
     )
     requested_total = request.options.get('cuda_graph_edge_capacity')
     capture_warmup = int(request.options.get('cuda_graph_capture_warmup', 3))
@@ -870,7 +882,7 @@ def run_md(request):
 
     if config.collect_statistics and 0 in observation_steps:
         record(0)
-    for step in range(1, config.steps + 1):
+    for step in nvtx_steps(config.steps, device):
         with profiler.phase('md_step'):
             output = graph_md.step()
         if config.collect_statistics and step in observation_steps:
