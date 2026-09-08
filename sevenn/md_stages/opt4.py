@@ -1,4 +1,4 @@
-"""SevenNet Opt4 route with the existing cuEquivariance fused scatter path."""
+"""Opt4 explicit, validated candidate dispatch; Opt3 remains the off path."""
 
 from __future__ import annotations
 
@@ -13,22 +13,8 @@ def run_md(request: MDRunRequest) -> MDRunResult:
         raise ValueError(
             f"SevenNet Opt4 route received {request.model}/{request.stage}"
         )
-    result, policy = run_opt4_with_opt3(request, opt3.run_md, model="sevennet")
+    result, _policy = run_opt4_with_opt3(request, opt3.run_md, model="sevennet")
     result.stage = "opt4"
-    result.metadata.update(policy.metadata)
-    result.metadata.update(
-        {
-            "opt4_model_strategy": "cuequivariance-tensor-product-scatter",
-            "opt4_fused_components": [
-                "tensor-product",
-                "edge-message",
-                "destination-scatter",
-            ],
-            "opt4_fixed_address_buffers": True,
-            "opt4_custom_kernel": False,
-            "opt4_reverse_edge_verified": False,
-        }
-    )
     validate_result(request, result)
     return result
 

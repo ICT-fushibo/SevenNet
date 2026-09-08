@@ -751,6 +751,11 @@ def run_md(request):
         dummy_atoms=int(request.options.get('cuda_graph_dummy_atoms', 32)),
     )
 
+    if request.options.get('_opt4_passes'):
+        from md_benchmark.opt4_registry import prepare_model
+        from .opt4_fusion import install
+        prepare_model(potential.model, request.options, install)
+
     # Setup-only eager reference and degree probe.  Existing total-edge CAP is
     # accepted for compatibility, but per-centre overflow remains authoritative.
     eager_reference = _SingleSystemPotential.__call__(potential, positions0)
