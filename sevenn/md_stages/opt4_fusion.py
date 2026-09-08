@@ -4,4 +4,5 @@ from md_benchmark.opt4_fx import install_tp_regions
 
 def install(model, passes, report):
     install_tp_regions(model, passes, report,
-        lambda path: "convolution" in path or "self_connection" in path or "gate" in path)
+        lambda path: "convolution" in path or "self_connection" in path or "gate" in path,
+        backward_policy="aten")
