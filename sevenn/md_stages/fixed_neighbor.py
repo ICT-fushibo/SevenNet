@@ -24,6 +24,7 @@ from md_benchmark.neighbor_utils import (
     normalize_neighbor_capacities,
     select_skin_candidates,
 )
+from md_benchmark.cap1_rob1 import VerletCandidateCapacityError
 
 
 def neighbor_capacity_from_probe(
@@ -98,6 +99,7 @@ class FixedShapeSevenNetNeighborBuilder:
         degeneracy_tolerance: float = 0.01,
         output_edge_index: Tensor | None = None,
         output_cell_offsets: Tensor | None = None,
+        overflow_to_dummy_only: bool = False,
     ) -> None:
         if num_atoms < 1:
             raise ValueError('num_atoms must be positive')
@@ -129,6 +131,7 @@ class FixedShapeSevenNetNeighborBuilder:
         self.neighbor_capacities = torch.as_tensor(
             capacities, dtype=torch.long, device=cell.device
         )
+        self.overflow_to_dummy_only = bool(overflow_to_dummy_only)
         if verlet_skin < 0:
             raise ValueError('verlet_skin must be non-negative')
         self.verlet_skin = float(verlet_skin)
@@ -229,6 +232,18 @@ class FixedShapeSevenNetNeighborBuilder:
         self.maximum_neighbors_by_atom = torch.zeros(
             self.num_atoms, device=self.device, dtype=torch.long
         )
+        self.overflow_dummy_only_replays = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.window_capacity_misses = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.window_overflow_dummy_only_replays = torch.zeros(
+            (), device=self.device, dtype=torch.long
+        )
+        self.window_maximum_neighbors_by_atom = torch.zeros(
+            self.num_atoms, device=self.device, dtype=torch.long
+        )
 
     @torch.no_grad()
     def initialize_skin(self, positions: Tensor) -> None:
@@ -248,11 +263,11 @@ class FixedShapeSevenNetNeighborBuilder:
             slots_per_atom=slots,
             min_distance_sqr=1.0e-4,
         )
-        torch._assert_async(
-            (counts <= slots).all(),
-            'SevenNet Opt3 Verlet candidate capacity is smaller than the '
-            'cutoff+skin candidate count',
-        )
+        if bool((counts > slots).any().item()):
+            raise VerletCandidateCapacityError(
+                'SevenNet Opt3 Verlet candidate capacity is smaller than the '
+                'cutoff+skin candidate count'
+            )
         if self.skin_candidate_ids is None:
             self.skin_candidate_ids = selected
             self.skin_candidate_mask = selected_valid
@@ -279,6 +294,14 @@ class FixedShapeSevenNetNeighborBuilder:
         self.maximum_neighbors_by_atom.zero_()
         self.skin_misses.zero_()
         self.skin_rebuilds = 0
+        self.overflow_dummy_only_replays.zero_()
+        self.reset_window_stats()
+
+    @torch.no_grad()
+    def reset_window_stats(self) -> None:
+        self.window_capacity_misses.zero_()
+        self.window_overflow_dummy_only_replays.zero_()
+        self.window_maximum_neighbors_by_atom.zero_()
 
     @torch.no_grad()
     def build(
@@ -306,10 +329,11 @@ class FixedShapeSevenNetNeighborBuilder:
                 self.inverse_cell,
             )
             self.skin_misses.add_(skin_miss.to(torch.long))
-            torch._assert_async(
-                ~skin_miss,
-                'SevenNet Opt3 Verlet skin exhausted; rebuild the candidate list',
-            )
+            if not self.overflow_to_dummy_only:
+                torch._assert_async(
+                    ~skin_miss,
+                    'SevenNet Opt3 Verlet skin exhausted; rebuild the candidate list',
+                )
             cached = self.skin_candidate_ids.reshape(-1)
             candidate_neighbors = self.candidate_neighbors.index_select(
                 0, cached
@@ -428,29 +452,31 @@ class FixedShapeSevenNetNeighborBuilder:
             0, self.selection_indices
         )
 
-        # SevenNet direction: centre -> neighbor.  Padding never touches a
-        # real atom and rotates across sinks to avoid one contended reduction.
-        self.edge_index[0].copy_(
-            torch.where(flat_valid, self.slot_centres, self.dummy_sinks)
-        )
-        self.edge_index[1].copy_(
-            torch.where(flat_valid, neighbors, self.dummy_sinks)
-        )
-        self.cell_offsets.copy_(
-            torch.where(
-                flat_valid.unsqueeze(1),
-                offsets.to(dtype=self.cell_offsets.dtype),
-                self.padding_cell_offsets,
-            )
-        )
-
-        real_edges = flat_valid.sum()
         maximum_neighbors = included_counts.max()
         excess_by_atom = torch.clamp_min(
             included_counts - self.neighbor_capacities, 0
         )
         maximum_excess = excess_by_atom.max()
         overflow = maximum_excess > 0
+        output_valid = flat_valid & ~overflow if self.overflow_to_dummy_only else flat_valid
+
+        # SevenNet direction: centre -> neighbor.  Padding never touches a
+        # real atom and rotates across sinks to avoid one contended reduction.
+        self.edge_index[0].copy_(
+            torch.where(output_valid, self.slot_centres, self.dummy_sinks)
+        )
+        self.edge_index[1].copy_(
+            torch.where(output_valid, neighbors, self.dummy_sinks)
+        )
+        self.cell_offsets.copy_(
+            torch.where(
+                output_valid.unsqueeze(1),
+                offsets.to(dtype=self.cell_offsets.dtype),
+                self.padding_cell_offsets,
+            )
+        )
+
+        real_edges = output_valid.sum()
         call_step = self.build_calls if step is None else step
         self.minimum_real_edges.copy_(
             torch.minimum(self.minimum_real_edges, real_edges)
@@ -465,12 +491,36 @@ class FixedShapeSevenNetNeighborBuilder:
             torch.maximum(self.maximum_neighbors_by_atom, included_counts)
         )
         self.capacity_misses.add_(overflow.to(torch.long))
+        self.window_maximum_neighbors_by_atom.copy_(
+            torch.maximum(
+                self.window_maximum_neighbors_by_atom, included_counts
+            )
+        )
+        if self.overflow_to_dummy_only:
+            self.window_capacity_misses.add_(overflow.to(torch.long))
+            self.overflow_dummy_only_replays.add_(overflow.to(torch.long))
+            self.window_overflow_dummy_only_replays.add_(overflow.to(torch.long))
         first = (self.first_overflow_step < 0) & overflow
         self.first_overflow_step.copy_(
             torch.where(first, call_step, self.first_overflow_step)
         )
         self.build_calls.add_(1)
         return self.edge_index, self.cell_offsets
+
+    def window_stats(self) -> dict[str, Any]:
+        return {
+            'fixed_builder_window_capacity_misses': int(
+                self.window_capacity_misses.item()
+            ),
+            'fixed_builder_window_overflow_dummy_only_replays': int(
+                self.window_overflow_dummy_only_replays.item()
+            ),
+            'fixed_builder_window_maximum_neighbors_by_atom': (
+                self.window_maximum_neighbors_by_atom.detach()
+                .to(device='cpu')
+                .tolist()
+            ),
+        }
 
     def stats(self) -> dict[str, Any]:
         """Synchronize once after production and expose capacity telemetry."""
@@ -484,6 +534,10 @@ class FixedShapeSevenNetNeighborBuilder:
         return {
             'fixed_builder_build_calls': calls,
             'fixed_builder_capacity_misses': misses,
+            'overflow_to_dummy_only': self.overflow_to_dummy_only,
+            'overflow_dummy_only_replays': int(
+                self.overflow_dummy_only_replays.item()
+            ),
             'fixed_builder_first_overflow_step': (
                 first_overflow if first_overflow >= 0 else None
             ),

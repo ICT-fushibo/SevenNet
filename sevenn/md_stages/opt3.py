@@ -23,6 +23,14 @@ from md_benchmark.neighbor_utils import (
     capacities_from_counts,
     normalize_neighbor_capacities,
 )
+from md_benchmark.cap1_rob1 import (
+    FixedAddressStateSnapshot,
+    Rob1Controller,
+    Rob1WindowStatus,
+    read_rob1_window_status,
+    transaction_boundaries,
+    verlet_rebuild_due,
+)
 from md_benchmark.opt3_profile import (
     model_nvtx_ranges,
     nvtx_stage,
@@ -582,10 +590,18 @@ class _SevenNetWholeStepGraph:
     def step(self) -> _ModelOutput:
         if self.graph is None:
             raise RuntimeError('Capture must complete before replay')
-        if (
-            self.verlet_rebuild_interval
-            and self.production_replays % self.verlet_rebuild_interval == 0
-        ):
+        if self.builder.overflow_to_dummy_only:
+            rebuild = verlet_rebuild_due(
+                self.production_replays,
+                self.verlet_rebuild_interval,
+                includes_initial_force=True,
+            )
+        else:
+            rebuild = bool(
+                self.verlet_rebuild_interval
+                and self.production_replays % self.verlet_rebuild_interval == 0
+            )
+        if rebuild:
             self.builder.initialize_skin(self.positions)
         self.graph.replay()
         self.production_replays += 1
@@ -659,6 +675,39 @@ class _SevenNetWholeStepGraph:
                 self.step_validation_within_tolerance
             ),
         }
+
+    def state_tensors(self) -> dict[str, torch.Tensor]:
+        state = {
+            'positions': self.positions,
+            'momenta': self.momenta,
+            'forces': self.forces,
+            'energy': self.energy,
+            'advance': self.advance,
+            'step_counter': self.step_counter,
+        }
+        if self.thermostat is not None:
+            state['eta'] = self.thermostat.eta
+            state['p_eta'] = self.thermostat.p_eta
+        return state
+
+    def reset_window_stats(self) -> None:
+        self.builder.reset_window_stats()
+
+    def window_status(self) -> Rob1WindowStatus:
+        return read_rob1_window_status(
+            capacity_misses=self.builder.window_capacity_misses,
+            overflow_dummy_only_replays=(
+                self.builder.window_overflow_dummy_only_replays
+            ),
+            maximum_required_by_atom=(
+                self.builder.window_maximum_neighbors_by_atom
+            ),
+            verlet_skin_misses=self.builder.skin_misses,
+        )
+
+    def release(self) -> None:
+        self.graph = None
+        self.capture_stream = None
 
 
 @profile_opt3
@@ -808,58 +857,116 @@ def run_md(request):
     edge_capacity = int(sum(capacities))
     if explicit_caps is None and request.options.get('per_atom_cap', False):
         capacity_source = 'initial-per-atom-cap-vector'
-    potential._initialize_static_graph(edge_capacity)
-    assert potential.static_edge_index is not None
-    assert potential.static_cell_shifts is not None
-    builder = FixedShapeSevenNetNeighborBuilder(
-        num_atoms=len(atoms),
-        cell=cell,
-        pbc=pbc,
-        cutoff=potential.cutoff,
-        neighbors_per_atom=neighbors_per_atom,
-        neighbor_capacities=capacities,
-        dummy_atoms=potential.dummy_atoms,
-        verlet_skin=float(request.options.get('verlet_skin', 0.0)),
-        verlet_candidate_capacity=request.options.get('verlet_candidate_capacity'),
-        max_neighbors=int(request.options.get('cuda_graph_max_neighbors', 300)),
-        degeneracy_tolerance=float(
-            request.options.get('cuda_graph_degeneracy_tolerance', 0.01)
-        ),
-        output_edge_index=potential.static_edge_index,
-        output_cell_offsets=potential.static_cell_shifts,
-    )
-    builder.initialize_skin(positions0)
+    rob1_enabled = bool(request.options.get('_opt4_rob1', False))
 
-    graph_md = _SevenNetWholeStepGraph(
-        potential,
-        builder,
-        positions=positions0,
-        momenta=momenta0,
-        masses=masses,
-        integrator=config.integrator,
-        temperature_k=config.temperature_k,
-        dt=config.timestep_fs * units.fs,
-        tau=config.thermostat_time_fs * units.fs,
-        capture_warmup=capture_warmup,
-        verlet_rebuild_interval=int(
-            request.options.get('verlet_rebuild_interval', 0)
-        ),
-        eager_reference=eager_reference,
-        energy_atol=energy_atol,
-        force_atol=force_atol,
-        state_atol=state_atol,
-    )
-    graph_md.capture()
+    def make_graph(
+        selected_capacities: list[int] | tuple[int, ...],
+        start_positions: torch.Tensor,
+        start_momenta: torch.Tensor,
+        reference: _ModelOutput,
+    ) -> _SevenNetWholeStepGraph:
+        potential._initialize_static_graph(int(sum(selected_capacities)))
+        assert potential.static_edge_index is not None
+        assert potential.static_cell_shifts is not None
+        generation_builder = FixedShapeSevenNetNeighborBuilder(
+            num_atoms=len(atoms),
+            cell=cell,
+            pbc=pbc,
+            cutoff=potential.cutoff,
+            neighbors_per_atom=max(selected_capacities),
+            neighbor_capacities=selected_capacities,
+            dummy_atoms=potential.dummy_atoms,
+            verlet_skin=float(request.options.get('verlet_skin', 0.0)),
+            verlet_candidate_capacity=request.options.get(
+                'verlet_candidate_capacity'
+            ),
+            max_neighbors=int(
+                request.options.get('cuda_graph_max_neighbors', 300)
+            ),
+            degeneracy_tolerance=float(
+                request.options.get('cuda_graph_degeneracy_tolerance', 0.01)
+            ),
+            output_edge_index=potential.static_edge_index,
+            output_cell_offsets=potential.static_cell_shifts,
+            overflow_to_dummy_only=rob1_enabled,
+        )
+        generation_builder.initialize_skin(start_positions)
+        generation = _SevenNetWholeStepGraph(
+            potential,
+            generation_builder,
+            positions=start_positions,
+            momenta=start_momenta,
+            masses=masses,
+            integrator=config.integrator,
+            temperature_k=config.temperature_k,
+            dt=config.timestep_fs * units.fs,
+            tau=config.thermostat_time_fs * units.fs,
+            capture_warmup=capture_warmup,
+            verlet_rebuild_interval=int(
+                request.options.get('verlet_rebuild_interval', 0)
+            ),
+            eager_reference=reference,
+            energy_atol=energy_atol,
+            force_atol=force_atol,
+            state_atol=state_atol,
+        )
+        generation.capture()
+        return generation
 
-    if config.warmup_steps:
+    graph_md = make_graph(capacities, positions0, momenta0, eager_reference)
+    controller: Rob1Controller | None = None
+    if rob1_enabled:
+
+        def generation_factory(
+            promoted: tuple[int, ...], snapshot: dict[str, torch.Tensor]
+        ) -> _SevenNetWholeStepGraph:
+            reference = _SingleSystemPotential.__call__(
+                potential, snapshot['positions']
+            )
+            generation = make_graph(
+                promoted,
+                snapshot['positions'],
+                snapshot['momenta'],
+                reference,
+            )
+            generation.production_replays = int(
+                snapshot['step_counter'].detach().cpu()
+            ) + 1
+            return generation
+
+        controller = Rob1Controller(
+            graph_md,
+            generation_factory=generation_factory,
+            atomic_numbers=atomic_numbers,
+            neighbor_capacities=capacities,
+        )
+        physical_initial = FixedAddressStateSnapshot(graph_md.state_tensors())
+        if config.warmup_steps:
+            controller.evaluate_initial()
+            complete = 0
+            for boundary in transaction_boundaries(
+                config.warmup_steps,
+                window_steps=int(request.options['rob1_window_steps']),
+                verlet_rebuild_interval=graph_md.verlet_rebuild_interval,
+            ):
+                controller.run_steps(boundary - complete)
+                complete = boundary
+        physical_initial.restore_into_(controller.generation.state_tensors())
+        graph_md = controller.generation
+        graph_md.builder.reset_stats()
+        graph_md.builder.initialize_skin(graph_md.positions)
+        graph_md.production_replays = 0
+        controller.begin_production()
+    else:
+        if config.warmup_steps:
+            graph_md.reset_production()
+            graph_md.evaluate_initial()
+            for _ in range(config.warmup_steps):
+                graph_md.step()
+            torch.cuda.synchronize(device)
+            graph_md.raise_for_overflow()
         graph_md.reset_production()
-        graph_md.evaluate_initial()
-        for _ in range(config.warmup_steps):
-            graph_md.step()
-        torch.cuda.synchronize(device)
-        graph_md.raise_for_overflow()
 
-    graph_md.reset_production()
     observations = []
     observation_steps = set(config.observation_steps)
     torch.cuda.reset_peak_memory_stats(device)
@@ -867,7 +974,15 @@ def run_md(request):
     profiler.start()
     started = time.perf_counter()
     with profiler.phase('initial_force'):
-        output = graph_md.evaluate_initial()
+        output = (
+            controller.evaluate_initial()
+            if controller is not None
+            else graph_md.evaluate_initial()
+        )
+    if controller is not None:
+        # Initial-force overflow may replace the graph generation.  Never let
+        # step-0 reporting read the retired generation's persistent buffers.
+        graph_md = controller.generation
 
     def record(step: int) -> None:
         # This is already a reporting synchronization point; detect capacity
@@ -887,13 +1002,31 @@ def run_md(request):
 
     if config.collect_statistics and 0 in observation_steps:
         record(0)
-    for step in nvtx_steps(config.steps, device):
-        with profiler.phase('md_step'):
-            output = graph_md.step()
-        if config.collect_statistics and step in observation_steps:
-            record(step)
+    if controller is None:
+        for step in nvtx_steps(config.steps, device):
+            with profiler.phase('md_step'):
+                output = graph_md.step()
+            if config.collect_statistics and step in observation_steps:
+                record(step)
+    else:
+        completed = 0
+        for step in transaction_boundaries(
+            config.steps,
+            window_steps=int(request.options['rob1_window_steps']),
+            observation_steps=(
+                config.observation_steps if config.collect_statistics else ()
+            ),
+            verlet_rebuild_interval=graph_md.verlet_rebuild_interval,
+        ):
+            with profiler.phase('md_step'):
+                output = controller.run_steps(step - completed)
+            completed = step
+            graph_md = controller.generation
+            if config.collect_statistics and step in observation_steps:
+                record(step)
     torch.cuda.synchronize(device)
-    graph_md.raise_for_overflow()
+    if controller is None:
+        graph_md.raise_for_overflow()
     profiler.stop()
     elapsed = time.perf_counter() - started
     peak_memory = torch.cuda.max_memory_allocated(device) / 1e9
@@ -906,13 +1039,20 @@ def run_md(request):
         output=output,
         step=config.steps,
     )
-    graph_stats = graph_md.stats()
+    graph_stats = graph_md.stats() if controller is None else controller.stats()
+    if controller is not None:
+        capacities = list(controller.current_capacities)
     expected_replays = config.steps + 1
-    if graph_stats['cuda_graph_production_replays'] != expected_replays:
+    actual_replays = (
+        graph_stats['cuda_graph_production_replays']
+        if controller is None
+        else graph_stats['rob1_committed_replays']
+    )
+    if actual_replays != expected_replays:
         raise RuntimeError(
             'SevenNet Opt3 replay count mismatch: '
             f'expected={expected_replays}, '
-            f"actual={graph_stats['cuda_graph_production_replays']}"
+            f"actual={actual_replays}"
         )
     result = MDRunResult(
         model=request.model,
@@ -953,9 +1093,13 @@ def run_md(request):
             'initial_probe_max_neighbors': initial_maximum,
             'dummy_padding': True,
             'sink_padding': 'distributed-dummy-bank',
-            'transactional_recovery': False,
-            'transaction_rollback': False,
-            'capacity_overflow_policy': 'raise-after-sync-no-fallback',
+            'transactional_recovery': rob1_enabled,
+            'transaction_rollback': rob1_enabled,
+            'capacity_overflow_policy': (
+                'rob1-rollback-promote-recapture-no-eager-fallback'
+                if rob1_enabled
+                else 'raise-after-sync-no-fallback'
+            ),
             'cuda_graph_buckets': 1,
             'tensor_product_accelerator': (
                 'cuequivariance' if potential.enable_cueq else None
