@@ -126,7 +126,7 @@ def install(model, passes, report, options):
         tensor_product="native-e3nn-gemm-and-instructions-unchanged",
         fused_boundaries=["convolution-destination-reduce"],
         backward_recomputes_reference=False,
-        forward_validation="IEEE associative-sum bound, extra atol capped at 3e-6",
+        forward_validation="chunked-float64 reference plus IEEE gamma_n bound",
         fusion_scope="forward-and-backward",
         sink_cutoff={"modules": bounded, "counted_as_fusion": False},
     )
