@@ -1,54 +1,18 @@
-"""SevenNet-owned e3nn convolution/gate region selection."""
+"""SevenNet Opt4: fixed-slot convolution destination reduction."""
+from __future__ import annotations
+
 import math
 import torch
 from torch import nn
-from md_benchmark.opt4_fx import install_tp_regions
-from md_benchmark.opt4_registry import FusionSetupError
 
-
-class _NativeTPVJP(torch.autograd.Function):
-    @staticmethod
-    def forward(reference, candidate, *args):
-        return candidate(*args)
-
-    @staticmethod
-    def setup_context(ctx, inputs, output):
-        ctx.reference = inputs[0]
-        ctx.save_for_backward(*inputs[2:])
-
-    @staticmethod
-    def backward(ctx, grad):
-        # One original, UNPARTITIONED graph preserves the full TP derivative
-        # grouping. Per-region native backwards do not preserve this grouping.
-        # This deliberately recomputes the native TP; report its cost honestly.
-        if torch.is_grad_enabled():
-            raise RuntimeError("SevenNet Opt4 native TP VJP supports MD first derivatives only")
-        args = tuple(x.detach().requires_grad_(needed)
-                     for x, needed in zip(ctx.saved_tensors, ctx.needs_input_grad[2:]))
-        active = tuple(x for x in args if x.requires_grad)
-        with torch.enable_grad():
-            out = ctx.reference(*args)
-            gradients = iter(torch.autograd.grad(out, active, grad, allow_unused=True))
-        return (None, None, *(next(gradients) if x.requires_grad else None for x in args))
-
-
-class NativeTPBackward(nn.Module):
-    """Candidate forward, explicit original TP VJP; MD first derivatives only."""
-    def __init__(self, reference, candidate):
-        super().__init__()
-        self.reference = reference
-        self.candidate = candidate
-
-    def forward(self, *args):
-        return _NativeTPVJP.apply(self.reference, self.candidate, *args)
+from md_benchmark.opt4_fx import CheckedRegion
+from md_benchmark.opt4_ops import csr_segment_sum
+from md_benchmark.opt4_registry import FusionSetupError, fixed_csr_layout, record
 
 
 class CompactSupportCutoff(nn.Module):
-    """Keep far sink edges out of the polynomial's unbounded extension.
+    """Keep far sink edges outside the released cutoff polynomial."""
 
-    Mask AFTER evaluating at a bounded radius: where(mask, poly(r), 0) alone
-    still permits inf intermediates and 0*inf in the force backward.
-    """
     def __init__(self, original, cutoff):
         super().__init__()
         self.original = original
@@ -61,9 +25,58 @@ class CompactSupportCutoff(nn.Module):
         return torch.where(radius < self.cutoff, value, 0.0)
 
 
-def install(model, passes, report):
-    # This model instance belongs to Opt4. Do not change EdgeEmbedding globally
-    # or alter Opt3/off. Neighbor connectivity and skin/CAP are unchanged.
+class _NativeScatter(nn.Module):
+    def __init__(self, edge_rows, rows):
+        super().__init__()
+        self.register_buffer("edge_rows", edge_rows, persistent=False)
+        self.rows = int(rows)
+
+    def forward(self, message):
+        out = message.new_zeros((self.rows, *message.shape[1:]))
+        out.index_add_(0, self.edge_rows, message)
+        return out
+
+
+class _FixedCSR(nn.Module):
+    def __init__(self, row_ptr, edge_rows, max_row):
+        super().__init__()
+        self.register_buffer("row_ptr", row_ptr, persistent=False)
+        self.register_buffer("edge_rows", edge_rows, persistent=False)
+        self.max_row = int(max_row)
+
+    def set_layout(self, row_ptr, edge_rows, max_row):
+        self.row_ptr = row_ptr
+        self.edge_rows = edge_rows
+        self.max_row = int(max_row)
+
+    def forward(self, message):
+        return csr_segment_sum(
+            message.contiguous(), self.row_ptr, self.edge_rows, self.max_row
+        )
+
+
+def _layout(options, parameter):
+    return fixed_csr_layout(
+        options,
+        parameter,
+        extra_rows=int(options.get("cuda_graph_dummy_atoms", 32)),
+    )
+
+
+def refresh(model, options):
+    row_ptr, edge_rows, max_row = _layout(options, next(model.parameters()))
+    for module in model.modules():
+        region = getattr(module, "_opt4_conv_csr", None)
+        if isinstance(region, CheckedRegion):
+            region.reference.edge_rows = edge_rows
+            region.reference.rows = row_ptr.shape[0] - 1
+            region.compiled.set_layout(row_ptr, edge_rows, max_row)
+            region.signatures.clear()
+
+
+def install(model, passes, report, options):
+    if "conv_tp_reduce_vjp" not in passes:
+        return
     bounded = []
     for path, module in list(model.named_modules()):
         if type(module).__name__ == "EdgeEmbedding":
@@ -71,23 +84,36 @@ def install(model, passes, report):
             if isinstance(cutoff, CompactSupportCutoff):
                 continue
             if type(cutoff).__name__ not in ("PolynomialCutoff", "XPLORCutoff"):
-                raise FusionSetupError("Unsupported SevenNet cutoff for Opt4 sink isolation")
+                raise FusionSetupError("Unsupported SevenNet cutoff for sink isolation")
             radius = getattr(cutoff, "cutoff_length", getattr(cutoff, "r_cut", None))
             module.cutoff_function = CompactSupportCutoff(cutoff, radius)
             bounded.append(path)
-    originals = {path: module for path, module in model.named_modules()
-                 if isinstance(module, torch.fx.GraphModule) and "_compiled_main" in path}
-    install_tp_regions(model, passes, report,
-        lambda path: "convolution" in path or "self_connection" in path or "gate" in path,
-        backward_policy="aten")
-    for path, reference in originals.items():
-        candidate = model.get_submodule(path)
-        if candidate is not reference:
-            parent, _, leaf = path.rpartition(".")
-            owner = model.get_submodule(parent) if parent else model
-            setattr(owner, leaf, NativeTPBackward(reference, candidate))
-    for entry in report["passes"].values():
-        entry.update(backward_policy="unpartitioned-native-TP-vjp", backward_recomputes_reference=True,
-                     fusion_scope="forward-only", performance_gate="must remeasure recomputation cost")
-        entry["sink_cutoff"] = {"modules": bounded, "policy": "bounded-evaluation-then-zero-outside-cutoff",
-                                "counted_as_fusion": False}
+
+    row_ptr, edge_rows, max_row = _layout(options, next(model.parameters()))
+    modules = []
+    for path, module in list(model.named_modules()):
+        if type(module).__name__ != "IrrepsConvolution":
+            continue
+        detail = {
+            "module": path,
+            "validated_shapes": 0,
+            "benchmark_requested": report.get("benchmark_boundaries", False),
+        }
+        module._opt4_conv_csr = CheckedRegion(
+            _NativeScatter(edge_rows, row_ptr.shape[0] - 1),
+            detail,
+            _FixedCSR(row_ptr, edge_rows, max_row),
+        )
+        modules.append(detail)
+    record(
+        report,
+        "conv_tp_reduce_vjp",
+        len(modules),
+        "triton-fixed-csr-explicit-vjp",
+        modules=modules,
+        tensor_product="native-e3nn-gemm-and-instructions-unchanged",
+        fused_boundaries=["convolution-destination-reduce"],
+        backward_recomputes_reference=False,
+        fusion_scope="forward-and-backward",
+        sink_cutoff={"modules": bounded, "counted_as_fusion": False},
+    )

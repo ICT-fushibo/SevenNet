@@ -865,6 +865,13 @@ def run_md(request):
         start_momenta: torch.Tensor,
         reference: _ModelOutput,
     ) -> _SevenNetWholeStepGraph:
+        if request.options.get('_opt4_passes'):
+            from .opt4_fusion import refresh
+
+            refresh(
+                potential.model,
+                {**request.options, 'neighbor_capacities': list(selected_capacities)},
+            )
         potential._initialize_static_graph(int(sum(selected_capacities)))
         assert potential.static_edge_index is not None
         assert potential.static_cell_shifts is not None

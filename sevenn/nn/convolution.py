@@ -130,7 +130,10 @@ class IrrepsConvolution(nn.Module):
 
         message = self.convolution(x[edge_src], data[self.key_filter], weight)
 
-        x = message_gather(x, edge_dst, message)
+        if hasattr(self, "_opt4_conv_csr"):
+            x = self._opt4_conv_csr(message)
+        else:
+            x = message_gather(x, edge_dst, message)
 
         x = x.div(self.denominator)
 
