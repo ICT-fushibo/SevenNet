@@ -5,7 +5,7 @@ import math
 import torch
 from torch import nn
 
-from md_benchmark.opt4_fx import CheckedRegion
+from md_benchmark.opt4_fx import CheckedRegion, assert_associative_sum_close
 from md_benchmark.opt4_ops import csr_segment_sum
 from md_benchmark.opt4_registry import FusionSetupError, fixed_csr_layout, record
 
@@ -52,6 +52,16 @@ class _FixedCSR(nn.Module):
     def forward(self, message):
         return csr_segment_sum(
             message.contiguous(), self.row_ptr, self.edge_rows, self.max_row
+        )
+
+    def validate_output(self, actual, expected, args):
+        assert_associative_sum_close(
+            actual,
+            expected,
+            args[0],
+            self.edge_rows,
+            self.row_ptr.shape[0] - 1,
+            self.max_row,
         )
 
 
@@ -116,6 +126,7 @@ def install(model, passes, report, options):
         tensor_product="native-e3nn-gemm-and-instructions-unchanged",
         fused_boundaries=["convolution-destination-reduce"],
         backward_recomputes_reference=False,
+        forward_validation="IEEE associative-sum bound, extra atol capped at 3e-6",
         fusion_scope="forward-and-backward",
         sink_cutoff={"modules": bounded, "counted_as_fusion": False},
     )
