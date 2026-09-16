@@ -1,132 +1,118 @@
-"""SevenNet Opt4: fixed-slot convolution destination reduction."""
+"""FastEq-inspired full SevenNet convolution boundary for Opt4.
+
+Algorithmic adaptation of FastEq commit 40ba40e72bee769d74a869bb4a4ba820ee1c55c0
+(MIT); the integration repository carries the complete third-party notice.
+"""
 from __future__ import annotations
 
 import math
 import torch
 from torch import nn
 
-from md_benchmark.opt4_fx import CheckedRegion, assert_associative_sum_close
-from md_benchmark.opt4_ops import csr_segment_sum
+from md_benchmark.opt4_fx import CheckedRegion
 from md_benchmark.opt4_registry import FusionSetupError, fixed_csr_layout, record
 
 
 class CompactSupportCutoff(nn.Module):
-    """Keep far sink edges outside the released cutoff polynomial."""
+    """Keep sink edges exactly outside the released cutoff polynomial."""
 
     def __init__(self, original, cutoff):
         super().__init__()
         self.original = original
         self.cutoff = float(cutoff)
         if not math.isfinite(self.cutoff) or self.cutoff <= 0:
-            raise FusionSetupError("SevenNet Opt4 requires a finite positive cutoff")
+            raise FusionSetupError("SevenNet FastEq adapter requires a positive cutoff")
 
     def forward(self, radius):
         value = self.original(radius.clamp(max=self.cutoff))
         return torch.where(radius < self.cutoff, value, 0.0)
 
 
-class _NativeScatter(nn.Module):
-    def __init__(self, edge_rows, rows):
+class _Uniform1DConvolution(nn.Module):
+    """Gather + channelwise TP + fixed destination reduction + epilogue."""
+
+    def __init__(self, convolution, edge_rows, rows):
         super().__init__()
+        object.__setattr__(self, "_convolution", convolution)
         self.register_buffer("edge_rows", edge_rows, persistent=False)
         self.rows = int(rows)
 
-    def forward(self, message):
-        out = message.new_zeros((self.rows, *message.shape[1:]))
-        out.index_add_(0, self.edge_rows, message)
-        return out
-
-
-class _FixedCSR(nn.Module):
-    def __init__(self, row_ptr, edge_rows, max_row):
-        super().__init__()
-        self.register_buffer("row_ptr", row_ptr, persistent=False)
-        self.register_buffer("edge_rows", edge_rows, persistent=False)
-        self.max_row = int(max_row)
-
-    def set_layout(self, row_ptr, edge_rows, max_row):
-        self.row_ptr = row_ptr
+    def set_layout(self, edge_rows, rows):
         self.edge_rows = edge_rows
-        self.max_row = int(max_row)
+        self.rows = int(rows)
 
-    def forward(self, message):
-        return csr_segment_sum(
-            message.contiguous(), self.row_ptr, self.edge_rows, self.max_row
-        )
-
-    def validate_output(self, actual, expected, args):
-        assert_associative_sum_close(
-            actual,
-            expected,
-            args[0],
-            self.edge_rows,
-            self.row_ptr.shape[0] - 1,
-            self.max_row,
-        )
+    def forward(self, x, edge_filter, weight, edge_src, denominator):
+        message = self._convolution(x.index_select(0, edge_src), edge_filter, weight)
+        out = message.new_zeros((self.rows, message.shape[-1]))
+        out.index_add_(0, self.edge_rows, message)
+        return out.div(denominator)
 
 
 def _layout(options, parameter):
-    return fixed_csr_layout(
+    row_ptr, edge_rows, _max_row = fixed_csr_layout(
         options,
         parameter,
         extra_rows=int(options.get("cuda_graph_dummy_atoms", 32)),
     )
+    return edge_rows, int(row_ptr.shape[0] - 1)
 
 
-def refresh(model, options):
-    row_ptr, edge_rows, max_row = _layout(options, next(model.parameters()))
+def refresh(model, options) -> None:
+    edge_rows, rows = _layout(options, next(model.parameters()))
     for module in model.modules():
-        region = getattr(module, "_opt4_conv_csr", None)
+        region = getattr(module, "_opt4_fasteq_uniform1d", None)
         if isinstance(region, CheckedRegion):
             module._opt4_edge_capacity = int(edge_rows.numel())
-            region.reference.edge_rows = edge_rows
-            region.reference.rows = row_ptr.shape[0] - 1
-            region.compiled.set_layout(row_ptr, edge_rows, max_row)
+            region.reference.set_layout(edge_rows, rows)
             region.signatures.clear()
 
 
 def install(model, passes, report, options):
-    if "conv_tp_reduce_vjp" not in passes:
+    if "fasteq_uniform1d_conv" not in passes:
         return
     bounded = []
     for path, module in list(model.named_modules()):
-        if type(module).__name__ == "EdgeEmbedding":
-            cutoff = module.cutoff_function
-            if isinstance(cutoff, CompactSupportCutoff):
-                continue
-            if type(cutoff).__name__ not in ("PolynomialCutoff", "XPLORCutoff"):
-                raise FusionSetupError("Unsupported SevenNet cutoff for sink isolation")
-            radius = getattr(cutoff, "cutoff_length", getattr(cutoff, "r_cut", None))
-            module.cutoff_function = CompactSupportCutoff(cutoff, radius)
-            bounded.append(path)
+        if type(module).__name__ != "EdgeEmbedding":
+            continue
+        cutoff = module.cutoff_function
+        if isinstance(cutoff, CompactSupportCutoff):
+            continue
+        if type(cutoff).__name__ not in ("PolynomialCutoff", "XPLORCutoff"):
+            raise FusionSetupError("unsupported SevenNet cutoff for sink isolation")
+        radius = getattr(cutoff, "cutoff_length", getattr(cutoff, "r_cut", None))
+        module.cutoff_function = CompactSupportCutoff(cutoff, radius)
+        bounded.append(path)
 
-    row_ptr, edge_rows, max_row = _layout(options, next(model.parameters()))
+    edge_rows, rows = _layout(options, next(model.parameters()))
     modules = []
     for path, module in list(model.named_modules()):
         if type(module).__name__ != "IrrepsConvolution":
             continue
+        if module.convolution is None:
+            raise FusionSetupError("SevenNet convolution must be instantiated before Opt4")
         detail = {
             "module": path,
             "validated_shapes": 0,
             "benchmark_requested": report.get("benchmark_boundaries", False),
         }
-        module._opt4_conv_csr = CheckedRegion(
-            _NativeScatter(edge_rows, row_ptr.shape[0] - 1),
-            detail,
-            _FixedCSR(row_ptr, edge_rows, max_row),
-        )
+        boundary = _Uniform1DConvolution(module.convolution, edge_rows, rows)
+        module._opt4_fasteq_uniform1d = CheckedRegion(boundary, detail)
         module._opt4_edge_capacity = int(edge_rows.numel())
         modules.append(detail)
     record(
         report,
-        "conv_tp_reduce_vjp",
+        "fasteq_uniform1d_conv",
         len(modules),
-        "triton-fixed-csr-explicit-vjp",
+        "inductor-triton-full-boundary-aot-vjp",
         modules=modules,
-        tensor_product="native-e3nn-gemm-and-instructions-unchanged",
-        fused_boundaries=["convolution-destination-reduce"],
-        backward_recomputes_reference=False,
-        forward_validation="chunked-float64 reference plus IEEE gamma_n bound",
-        fusion_scope="forward-and-backward",
+        fused_boundaries=[
+            "source-gather",
+            "tp-instruction-chain",
+            "destination-reduce",
+            "denominator",
+        ],
+        gemm="original-e3nn",
+        backward="aot-compiled-complete-input-vjp",
+        replay_runtime_compile=False,
         sink_cutoff={"modules": bounded, "counted_as_fusion": False},
     )

@@ -128,17 +128,21 @@ class IrrepsConvolution(nn.Module):
         edge_src = data[self.key_edge_idx][1]
         edge_dst = data[self.key_edge_idx][0]
 
-        message = self.convolution(x[edge_src], data[self.key_filter], weight)
-
         if (
-            hasattr(self, "_opt4_conv_csr")
-            and message.shape[0] == self._opt4_edge_capacity
+            hasattr(self, "_opt4_fasteq_uniform1d")
+            and edge_src.shape[0] == self._opt4_edge_capacity
         ):
-            x = self._opt4_conv_csr(message)
+            x = self._opt4_fasteq_uniform1d(
+                x,
+                data[self.key_filter],
+                weight,
+                edge_src,
+                self.denominator,
+            )
         else:
+            message = self.convolution(x[edge_src], data[self.key_filter], weight)
             x = message_gather(x, edge_dst, message)
-
-        x = x.div(self.denominator)
+            x = x.div(self.denominator)
 
         if self.is_parallel:
             x = torch.tensor_split(x, data[KEY.NLOCAL])[0]
