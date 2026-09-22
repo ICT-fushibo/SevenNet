@@ -16,6 +16,7 @@ import time
 import warnings
 from pathlib import Path
 
+import ase.io
 import numpy as np
 import torch
 from ase import units
@@ -733,13 +734,10 @@ def run_md(request):
         raise RuntimeError('SevenNet opt3 forbids TF32 override')
     if request.atoms.constraints:
         raise NotImplementedError('SevenNet opt3 does not support constraints')
-    if request.config.collect_trajectory or request.output_path is not None:
+    if request.options.get('compute_stress', False) and not request.config.collect_trajectory:
         raise NotImplementedError(
-            'SevenNet opt3 supports observation statistics but not trajectory '
-            'or stress capture'
+            'SevenNet Opt3 computes stress only at trajectory record boundaries'
         )
-    if request.options.get('compute_stress', False):
-        raise NotImplementedError('SevenNet opt3 does not capture stress')
 
     torch.set_float32_matmul_precision('highest')
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -749,7 +747,7 @@ def run_md(request):
         device = torch.device('cuda', torch.cuda.current_device())
     config = request.config
     atoms = request.atoms.copy()
-    _configure_output(request)
+    target_path, partial_path = _configure_output(request)
 
     positions0 = torch.tensor(
         np.asarray(atoms.positions), device=device, dtype=torch.float64
@@ -798,6 +796,21 @@ def run_md(request):
         energy_atol=energy_atol,
         force_atol=force_atol,
         dummy_atoms=int(request.options.get('cuda_graph_dummy_atoms', 32)),
+    )
+    stress_potential = (
+        _SingleSystemPotential(
+            request.model_path,
+            device=device,
+            atomic_numbers=atomic_numbers,
+            cell=cell,
+            pbc=pbc,
+            modal=request.options.get('modal'),
+            compute_stress=True,
+            profiler=profiler,
+            enable_cueq=False,
+        )
+        if config.collect_trajectory
+        else None
     )
 
     if request.options.get('_opt4_passes'):
@@ -975,6 +988,9 @@ def run_md(request):
         graph_md.reset_production()
 
     observations = []
+    in_memory_trajectory = (
+        [] if config.collect_trajectory and target_path is None else None
+    )
     observation_steps = set(config.observation_steps)
     torch.cuda.reset_peak_memory_stats(device)
     torch.cuda.synchronize(device)
@@ -991,7 +1007,7 @@ def run_md(request):
         # step-0 reporting read the retired generation's persistent buffers.
         graph_md = controller.generation
 
-    def record(step: int) -> None:
+    def record_observation(step: int) -> None:
         # This is already a reporting synchronization point; detect capacity
         # failure before exporting a potentially truncated observation.
         graph_md.raise_for_overflow()
@@ -1007,14 +1023,41 @@ def run_md(request):
             )
         )
 
+    def record_frame(step: int) -> None:
+        if stress_potential is None:
+            raise RuntimeError('SevenNet trajectory stress evaluator is missing')
+        stress_output = stress_potential(graph_md.positions)
+        if stress_output.stress is None:
+            raise RuntimeError('SevenNet trajectory stress evaluator returned no stress')
+        frame = _frame(
+            atoms,
+            positions=graph_md.positions,
+            momenta=graph_md.momenta,
+            output=_ModelOutput(
+                energy=output.energy,
+                forces=output.forces,
+                stress=stress_output.stress,
+            ),
+            step=step,
+        )
+        if partial_path is not None:
+            ase.io.write(partial_path, frame, append=True, format='extxyz')
+        else:
+            assert in_memory_trajectory is not None
+            in_memory_trajectory.append(frame)
+
+    if config.collect_trajectory:
+        record_frame(0)
     if config.collect_statistics and 0 in observation_steps:
-        record(0)
+        record_observation(0)
     if controller is None:
         for step in nvtx_steps(config.steps, device):
             with profiler.phase('md_step'):
                 output = graph_md.step()
             if config.collect_statistics and step in observation_steps:
-                record(step)
+                record_observation(step)
+            if config.collect_trajectory and step % config.record_interval == 0:
+                record_frame(step)
     else:
         completed = 0
         for step in transaction_boundaries(
@@ -1023,6 +1066,9 @@ def run_md(request):
             observation_steps=(
                 config.observation_steps if config.collect_statistics else ()
             ),
+            record_interval=(
+                config.record_interval if config.collect_trajectory else 0
+            ),
             verlet_rebuild_interval=graph_md.verlet_rebuild_interval,
         ):
             with profiler.phase('md_step'):
@@ -1030,7 +1076,9 @@ def run_md(request):
             completed = step
             graph_md = controller.generation
             if config.collect_statistics and step in observation_steps:
-                record(step)
+                record_observation(step)
+            if config.collect_trajectory and step % config.record_interval == 0:
+                record_frame(step)
     torch.cuda.synchronize(device)
     if controller is None:
         graph_md.raise_for_overflow()
@@ -1038,6 +1086,9 @@ def run_md(request):
     elapsed = time.perf_counter() - started
     peak_memory = torch.cuda.max_memory_allocated(device) / 1e9
     performance_profile = profiler.summary(synchronize=False)
+    if target_path is not None:
+        assert partial_path is not None
+        os.replace(partial_path, target_path)
 
     final_atoms = _frame(
         atoms,
@@ -1069,6 +1120,8 @@ def run_md(request):
         peak_cuda_memory_gb=peak_memory,
         final_atoms=final_atoms,
         observations=observations,
+        trajectory=in_memory_trajectory,
+        trajectory_path=str(target_path) if target_path is not None else None,
         metadata={
             'engine': 'sevennet_gpu_resident_whole_step_cuda_graph',
             'backend': 'whole-step-cuda-graph',
@@ -1112,7 +1165,13 @@ def run_md(request):
                 'cuequivariance' if potential.enable_cueq else None
             ),
             'model_specific_fusion': bool(potential.enable_cueq),
-            'compute_stress': False,
+            'compute_stress': config.collect_trajectory,
+            'trajectory_stress_backend': (
+                'eager-record-boundary-same-checkpoint'
+                if config.collect_trajectory
+                else None
+            ),
+            'trajectory_stress_cost_in_elapsed': config.collect_trajectory,
             'performance_profile': performance_profile,
             'modal': request.options.get('modal'),
             **graph_stats,

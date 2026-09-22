@@ -25,6 +25,13 @@ def test_neighbor_capacity_uses_esen_cap_rounding() -> None:
     assert neighbor_capacity_from_probe(48, margin=0.0, slot_step=8) == 56
 
 
+def test_opt3_source_contains_record_boundary_stress_observer() -> None:
+    source = inspect.getsource(run_md)
+    assert "eager-record-boundary-same-checkpoint" in source
+    assert "record_frame(0)" in source
+    assert "compute_stress=True" in source
+
+
 def test_guarded_total_capacity_is_aligned_without_a_second_guard() -> None:
     # The Opt2 total-edge probe already includes factor/headroom.
     assert _guarded_uniform_capacity_from_total(2816, 32) == 88
