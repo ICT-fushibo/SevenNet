@@ -43,14 +43,21 @@ class SevenNetStressTests(unittest.TestCase):
                         .reshape(1),
                     }
                 )
-                return output[KEY.PRED_FORCE], sevennet_stress(
+                # Mirror _WholeStepPotential._static_forward: retain values,
+                # never the eager stress graph (rij * dE/dr still has grad_fn).
+                # Otherwise this default-stream AccumulateGrad survives into
+                # the side-stream capture (cudaErrorStreamCaptureImplicit).
+                return output[KEY.PRED_FORCE].detach(), sevennet_stress(
                     output[KEY.PRED_STRESS]
-                )
+                ).detach()
 
-            _, stress = body()
-            torch.testing.assert_close(
-                stress, edges.T @ (edges * mask[:, None]) / 60
-            )
+            force, stress = body()
+            self.assertFalse(force.requires_grad)
+            self.assertIsNone(stress.grad_fn)
+            self.assertFalse(stress.requires_grad)
+            with torch.no_grad():
+                reference = edges.T @ (edges * mask[:, None]) / 60
+            torch.testing.assert_close(stress, reference)
             assert_replay_stable(body)
             mask.zero_()
             force, stress = body()
