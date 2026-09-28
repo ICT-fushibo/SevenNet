@@ -20,10 +20,6 @@ import ase.io
 import numpy as np
 import torch
 from ase import units
-from md_benchmark.neighbor_utils import (
-    capacities_from_counts,
-    normalize_neighbor_capacities,
-)
 from md_benchmark.cap1_rob1 import (
     FixedAddressStateSnapshot,
     Rob1Controller,
@@ -31,6 +27,10 @@ from md_benchmark.cap1_rob1 import (
     read_rob1_window_status,
     transaction_boundaries,
     verlet_rebuild_due,
+)
+from md_benchmark.neighbor_utils import (
+    capacities_from_counts,
+    normalize_neighbor_capacities,
 )
 from md_benchmark.opt3_profile import (
     model_nvtx_ranges,
@@ -94,11 +94,34 @@ def _guarded_uniform_capacity_from_total(
 class _WholeStepPotential(_ModelOnlyCUDAGraphPotential):
     """SevenNet fixed-buffer model input owned by the whole-step graph."""
 
-    def __init__(self, *args, dummy_atoms: int, **kwargs) -> None:
+    def __init__(
+        self, *args, dummy_atoms: int, capture_stress: bool = False, **kwargs
+    ) -> None:
         if dummy_atoms < 1:
             raise ValueError('cuda_graph_dummy_atoms must be positive')
         self.dummy_atoms = int(dummy_atoms)
         super().__init__(*args, **kwargs)
+        self.capture_stress = capture_stress
+        if capture_stress:
+            self.compute_stress = True
+            self.model._modules['force_output'].compute_stress = True
+
+    def _static_forward(self):
+        if not self.capture_stress:
+            return super()._static_forward()
+        from md_benchmark.stress_capture import sevennet_stress
+
+        self.static_graph[key.NODE_FEATURE] = self.static_type_indices
+        self.static_graph[key.EDGE_IDX] = self.static_edge_index
+        self.static_graph[key.EDGE_VEC] = self.static_edge_vec
+        self.static_graph[key.POS] = self.static_model_positions
+        with torch.enable_grad():
+            output = self.model(self.static_graph)
+        self.last_stress = sevennet_stress(output[key.PRED_STRESS]).detach()
+        return (
+            output[key.PRED_FORCE][: self.n_real].detach(),
+            output[key.PRED_TOTAL_ENERGY].sum().detach(),
+        )
 
     def _initialize_static_graph(self, edge_capacity: int) -> None:
         self.edge_capacity = int(edge_capacity)
@@ -206,8 +229,7 @@ def _integrate_nhc_pure(
             )
         else:
             g_j = (
-                values[index - 1].square() / thermostat.q[index - 1]
-                - thermostat.k_t
+                values[index - 1].square() / thermostat.q[index - 1] - thermostat.k_t
             )
         values[index] = values[index] + delta2 * g_j
         if index < len(values) - 1:
@@ -270,6 +292,11 @@ class _SevenNetWholeStepGraph:
         self.momenta = momenta.detach().clone()
         self.forces = torch.zeros_like(self.positions)
         self.energy = torch.zeros((), device=self.device, dtype=torch.float64)
+        self.stress = (
+            torch.zeros((3, 3), device=self.device, dtype=torch.float64)
+            if potential.capture_stress
+            else None
+        )
         self.masses = masses
         self.integrator_name = integrator
         self.temperature_k = float(temperature_k)
@@ -324,6 +351,8 @@ class _SevenNetWholeStepGraph:
         self.momenta.copy_(self.initial_momenta)
         self.forces.zero_()
         self.energy.zero_()
+        if self.stress is not None:
+            self.stress.zero_()
         self.advance.zero_()
         self.step_counter.zero_()
         if self.thermostat is not None:
@@ -363,9 +392,7 @@ class _SevenNetWholeStepGraph:
                 self.dt / 2,
             )
             half_momenta = half_momenta + 0.5 * self.dt * self.forces
-            advanced_positions = (
-                old_positions + self.dt * half_momenta / self.masses
-            )
+            advanced_positions = old_positions + self.dt * half_momenta / self.masses
         evaluation_positions = old_positions + self.advance * (
             advanced_positions - old_positions
         )
@@ -390,14 +417,14 @@ class _SevenNetWholeStepGraph:
                 self.thermostat,
                 self.dt / 2,
             )
-        final_momenta = old_momenta + self.advance * (
-            advanced_momenta - old_momenta
-        )
+        final_momenta = old_momenta + self.advance * (advanced_momenta - old_momenta)
         with torch.no_grad():
             self.positions.copy_(evaluation_positions)
             self.momenta.copy_(final_momenta)
             self.forces.copy_(forces)
             self.energy.copy_(model_energy)
+            if self.stress is not None:
+                self.stress.copy_(self.potential.last_stress)
             if self.thermostat is not None:
                 assert eta_final is not None and p_eta_final is not None
                 self.thermostat.eta.copy_(
@@ -421,6 +448,8 @@ class _SevenNetWholeStepGraph:
             self.builder.edge_index,
             self.builder.cell_offsets,
         ]
+        if self.stress is not None:
+            tensors.append(self.stress)
         if self.thermostat is not None:
             tensors.extend((self.thermostat.eta, self.thermostat.p_eta))
         return (
@@ -479,6 +508,15 @@ class _SevenNetWholeStepGraph:
             self.validation_energy_abs_error <= self.energy_atol
             and self.validation_force_max_abs_error <= self.force_atol
         )
+        if self.stress is not None:
+            from md_benchmark.stress_capture import validate_stress
+
+            validate_stress(
+                self.stress,
+                self.eager_reference.stress,
+                dtype=self.potential.static_edge_vec.dtype,
+                context='SevenNet initial captured stress',
+            )
         if not bool(torch.isfinite(self.energy)) or not bool(
             torch.isfinite(self.forces).all()
         ):
@@ -520,6 +558,15 @@ class _SevenNetWholeStepGraph:
             )
         self.raise_for_overflow()
         graph_state = self._validation_state()
+        if self.stress is not None:
+            from md_benchmark.stress_capture import validate_stress
+
+            validate_stress(
+                graph_state['stress'],
+                eager_state['stress'],
+                dtype=self.potential.static_edge_vec.dtype,
+                context='SevenNet replay stress',
+            )
         errors = {
             name: float((graph_state[name] - eager_state[name]).abs().max().item())
             for name in eager_state
@@ -540,6 +587,7 @@ class _SevenNetWholeStepGraph:
             'energy': self.energy_atol,
             'thermostat_eta': self.state_atol,
             'thermostat_p_eta': self.state_atol,
+            'stress': 1e-5,
         }
         self.step_validation_within_tolerance = all(
             errors[name] <= tolerances[name] for name in errors
@@ -565,6 +613,8 @@ class _SevenNetWholeStepGraph:
             'forces': self.forces.clone(),
             'energy': self.energy.clone(),
         }
+        if self.stress is not None:
+            state['stress'] = self.stress.clone()
         if self.thermostat is not None:
             state['thermostat_eta'] = self.thermostat.eta.clone()
             state['thermostat_p_eta'] = self.thermostat.p_eta.clone()
@@ -613,7 +663,7 @@ class _SevenNetWholeStepGraph:
         return _ModelOutput(
             energy=self.energy,
             forces=self.forces,
-            stress=None,
+            stress=self.stress,
         )
 
     def raise_for_overflow(self) -> None:
@@ -686,6 +736,8 @@ class _SevenNetWholeStepGraph:
             'advance': self.advance,
             'step_counter': self.step_counter,
         }
+        if self.stress is not None:
+            state['stress'] = self.stress
         if self.thermostat is not None:
             state['eta'] = self.thermostat.eta
             state['p_eta'] = self.thermostat.p_eta
@@ -700,9 +752,7 @@ class _SevenNetWholeStepGraph:
             overflow_dummy_only_replays=(
                 self.builder.window_overflow_dummy_only_replays
             ),
-            maximum_required_by_atom=(
-                self.builder.window_maximum_neighbors_by_atom
-            ),
+            maximum_required_by_atom=(self.builder.window_maximum_neighbors_by_atom),
             verlet_skin_misses=self.builder.skin_misses,
         )
 
@@ -734,7 +784,10 @@ def run_md(request):
         raise RuntimeError('SevenNet opt3 forbids TF32 override')
     if request.atoms.constraints:
         raise NotImplementedError('SevenNet opt3 does not support constraints')
-    if request.options.get('compute_stress', False) and not request.config.collect_trajectory:
+    if (
+        request.options.get('compute_stress', False)
+        and not request.config.collect_trajectory
+    ):
         raise NotImplementedError(
             'SevenNet Opt3 computes stress only at trajectory record boundaries'
         )
@@ -773,9 +826,7 @@ def run_md(request):
     requested_total = request.options.get('cuda_graph_edge_capacity')
     capture_warmup = int(request.options.get('cuda_graph_capture_warmup', 3))
     energy_atol = float(request.options.get('cuda_graph_energy_atol_ev', 2e-4))
-    force_atol = float(
-        request.options.get('cuda_graph_force_atol_ev_per_a', 2e-4)
-    )
+    force_atol = float(request.options.get('cuda_graph_force_atol_ev_per_a', 2e-4))
     state_atol = float(request.options.get('cuda_graph_state_atol', 1e-10))
     potential = _WholeStepPotential(
         request.model_path,
@@ -796,6 +847,7 @@ def run_md(request):
         energy_atol=energy_atol,
         force_atol=force_atol,
         dummy_atoms=int(request.options.get('cuda_graph_dummy_atoms', 32)),
+        capture_stress=bool(request.options.get('_opt4_capture_stress', False)),
     )
     stress_potential = (
         _SingleSystemPotential(
@@ -809,13 +861,15 @@ def run_md(request):
             profiler=profiler,
             enable_cueq=False,
         )
-        if config.collect_trajectory
+        if config.collect_trajectory and not potential.capture_stress
         else None
     )
 
     if request.options.get('_opt4_passes'):
         from md_benchmark.opt4_registry import prepare_model
+
         from .opt4_fusion import install
+
         prepare_model(potential.model, request.options, install)
 
     # Setup-only eager reference and degree probe.  Existing total-edge CAP is
@@ -845,12 +899,15 @@ def run_md(request):
             )
         neighbors_per_atom = max(inferred_capacity, total_floor)
         capacity_source = 'total-edge-plus-initial-per-atom'
-    initial_counts = torch.bincount(initial_index[0], minlength=len(atoms))[: len(atoms)]
+    initial_counts = torch.bincount(initial_index[0], minlength=len(atoms))[
+        : len(atoms)
+    ]
     explicit_caps = request.options.get('neighbor_capacities')
     if explicit_caps is None and request.options.get('per_atom_cap', False):
         capacities = capacities_from_counts(
             initial_counts,
-            factor=float(request.options.get('cuda_graph_neighbor_margin', 0.10)) + 1.0,
+            factor=float(request.options.get('cuda_graph_neighbor_margin', 0.10))
+            + 1.0,
             headroom=1,
             alignment=int(request.options.get('cuda_graph_neighbor_step', 8)),
         )
@@ -867,7 +924,6 @@ def run_md(request):
         raise CUDAGraphCapacityError(
             int(initial_counts.max().item()), int(max(capacities))
         )
-    edge_capacity = int(sum(capacities))
     if explicit_caps is None and request.options.get('per_atom_cap', False):
         capacity_source = 'initial-per-atom-cap-vector'
     rob1_enabled = bool(request.options.get('_opt4_rob1', False))
@@ -883,7 +939,10 @@ def run_md(request):
 
             refresh(
                 potential.model,
-                {**request.options, 'neighbor_capacities': list(selected_capacities)},
+                {
+                    **request.options,
+                    'neighbor_capacities': list(selected_capacities),
+                },
             )
         potential._initialize_static_graph(int(sum(selected_capacities)))
         assert potential.static_edge_index is not None
@@ -900,9 +959,7 @@ def run_md(request):
             verlet_candidate_capacity=request.options.get(
                 'verlet_candidate_capacity'
             ),
-            max_neighbors=int(
-                request.options.get('cuda_graph_max_neighbors', 300)
-            ),
+            max_neighbors=int(request.options.get('cuda_graph_max_neighbors', 300)),
             degeneracy_tolerance=float(
                 request.options.get('cuda_graph_degeneracy_tolerance', 0.01)
             ),
@@ -949,9 +1006,9 @@ def run_md(request):
                 snapshot['momenta'],
                 reference,
             )
-            generation.production_replays = int(
-                snapshot['step_counter'].detach().cpu()
-            ) + 1
+            generation.production_replays = (
+                int(snapshot['step_counter'].detach().cpu()) + 1
+            )
             return generation
 
         controller = Rob1Controller(
@@ -1024,11 +1081,16 @@ def run_md(request):
         )
 
     def record_frame(step: int) -> None:
-        if stress_potential is None:
-            raise RuntimeError('SevenNet trajectory stress evaluator is missing')
-        stress_output = stress_potential(graph_md.positions)
+        if graph_md.stress is not None:
+            stress_output = graph_md.output()
+        else:
+            if stress_potential is None:
+                raise RuntimeError('SevenNet trajectory stress evaluator is missing')
+            stress_output = stress_potential(graph_md.positions)
         if stress_output.stress is None:
-            raise RuntimeError('SevenNet trajectory stress evaluator returned no stress')
+            raise RuntimeError(
+                'SevenNet trajectory stress evaluator returned no stress'
+            )
         frame = _frame(
             atoms,
             positions=graph_md.positions,
@@ -1040,6 +1102,9 @@ def run_md(request):
             ),
             step=step,
         )
+        from md_benchmark.stress_capture import save_validation_frame
+
+        save_validation_frame(frame, request.options)
         if partial_path is not None:
             ase.io.write(partial_path, frame, append=True, format='extxyz')
         else:
@@ -1110,7 +1175,7 @@ def run_md(request):
         raise RuntimeError(
             'SevenNet Opt3 replay count mismatch: '
             f'expected={expected_replays}, '
-            f"actual={actual_replays}"
+            f'actual={actual_replays}'
         )
     result = MDRunResult(
         model=request.model,
@@ -1195,5 +1260,17 @@ def run_md(request):
             **graph_stats,
         },
     )
+    if potential.capture_stress:
+        from md_benchmark.stress_capture import BACKEND, capture_metadata
+
+        result.metadata.update(
+            capture_metadata(True, stable=graph_md.output_addresses_stable)
+        )
+        result.metadata.update(
+            trajectory_stress_backend=BACKEND,
+            trajectory_stress_recompute_count=0,
+            trajectory_record_model_calls=0,
+            trajectory_stress_source='captured-current-committed-state',
+        )
     validate_result(request, result)
     return result
