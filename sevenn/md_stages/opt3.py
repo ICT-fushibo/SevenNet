@@ -103,6 +103,12 @@ class _WholeStepPotential(_ModelOnlyCUDAGraphPotential):
         super().__init__(*args, **kwargs)
         self.capture_stress = capture_stress
         if capture_stress:
+            from .opt4_fusion import install_sink_cutoff
+
+            # This is padding correctness, not fusion. Opt4-off stress must
+            # have the same finite sink behavior as the fused path. Leave the
+            # legacy Opt3/default path untouched.
+            install_sink_cutoff(self.model)
             self.compute_stress = True
             self.model._modules['force_output'].compute_stress = True
 
@@ -1271,6 +1277,7 @@ def run_md(request):
             trajectory_stress_recompute_count=0,
             trajectory_record_model_calls=0,
             trajectory_stress_source='captured-current-committed-state',
+            stress_sink_isolation='compact-support-cutoff-not-counted-as-fusion',
         )
     validate_result(request, result)
     return result

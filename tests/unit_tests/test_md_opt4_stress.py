@@ -5,10 +5,34 @@ from md_benchmark.stress_capture import sevennet_stress
 from md_benchmark.stress_test_support import assert_replay_stable
 
 from sevenn import _keys as KEY
+from sevenn.md_stages.opt4_fusion import CompactSupportCutoff
+from sevenn.nn.edge_embedding import PolynomialCutoff
 from sevenn.nn.force_output import ForceStressOutputFromEdge
 
 
 class SevenNetStressTests(unittest.TestCase):
+    def test_far_padding_cutoff_value_vjp_replay(self):
+        for dtype in (torch.float32, torch.float64):
+            radius = torch.tensor(
+                [1.0, 4.9, 5.0, 30.0, 1e6],
+                device='cuda:0',
+                dtype=dtype,
+                requires_grad=True,
+            )
+            cutoff = CompactSupportCutoff(PolynomialCutoff(5.0), 5.0).to('cuda:0')
+
+            def body(cutoff=cutoff, radius=radius):
+                value = cutoff(radius)
+                gradient = torch.autograd.grad(value.sum(), radius)[0]
+                return value.detach(), gradient.detach()
+
+            value, gradient = body()
+            self.assertTrue(bool(torch.isfinite(value).all()))
+            self.assertTrue(bool(torch.isfinite(gradient).all()))
+            self.assertEqual(float(value[2:].abs().max()), 0)
+            self.assertEqual(float(gradient[2:].abs().max()), 0)
+            assert_replay_stable(body)
+
     def test_native_edge_gradient_stress_and_cuda_replay(self):
         for dtype in (torch.float32, torch.float64):
             edges = torch.tensor(

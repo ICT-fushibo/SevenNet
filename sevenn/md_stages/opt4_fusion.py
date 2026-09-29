@@ -67,9 +67,14 @@ def refresh(model, options) -> None:
             region.signatures.clear()
 
 
-def install(model, passes, report, options):
-    if "fasteq_uniform1d_conv" not in passes:
-        return
+def install_sink_cutoff(model):
+    """Bound disconnected padding, independently of optional TP fusion.
+
+    Real edges retain the checkpoint polynomial and its derivative. Evaluating
+    that polynomial at far sink distances can overflow intermediate dummy
+    features; a zero real-atom readout does not prevent 0 * inf in their VJP.
+    Stress reduces all edge gradients, unlike the sliced real-atom forces.
+    """
     bounded = []
     for path, module in list(model.named_modules()):
         if type(module).__name__ != "EdgeEmbedding":
@@ -82,6 +87,13 @@ def install(model, passes, report, options):
         radius = getattr(cutoff, "cutoff_length", getattr(cutoff, "r_cut", None))
         module.cutoff_function = CompactSupportCutoff(cutoff, radius)
         bounded.append(path)
+    return bounded
+
+
+def install(model, passes, report, options):
+    if "fasteq_uniform1d_conv" not in passes:
+        return
+    bounded = install_sink_cutoff(model)
 
     edge_rows, rows = _layout(options, next(model.parameters()))
     modules = []
