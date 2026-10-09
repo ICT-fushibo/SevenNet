@@ -474,7 +474,8 @@ class _SevenNetWholeStepGraph:
         self.potential.static_graph[key.EDGE_VEC] = capture_edge_vec
 
         current_stream = torch.cuda.current_stream(self.device)
-        side_stream = torch.cuda.Stream(device=self.device)
+        side_stream = (current_stream if getattr(self.potential, 'benchmark_capture_scope', 'whole-step') == 'fixed-eager'
+                       else torch.cuda.Stream(device=self.device))
         self.capture_stream = side_stream
         side_stream.wait_stream(current_stream)
         with torch.cuda.stream(side_stream):
