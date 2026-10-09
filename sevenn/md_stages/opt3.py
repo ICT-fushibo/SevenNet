@@ -489,13 +489,14 @@ class _SevenNetWholeStepGraph:
         torch.cuda.synchronize(self.device)
 
         started = time.perf_counter()
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, stream=side_stream):
-            self._graph_body()
+        from md_benchmark.capture_scope import capture_execution
+        graph = capture_execution(
+            self._graph_body, self.builder, stream=side_stream,
+            scope=getattr(self.potential, 'benchmark_capture_scope', 'whole-step'))
         torch.cuda.synchronize(self.device)
         self.capture_wall_time_s = time.perf_counter() - started
         self.graph = graph
-        self.capture_count = 1
+        self.capture_count = graph.capture_count
 
         addresses = self._persistent_addresses()
         self.restore_initial_()
@@ -855,6 +856,10 @@ def run_md(request):
         dummy_atoms=int(request.options.get('cuda_graph_dummy_atoms', 32)),
         capture_stress=bool(request.options.get('_opt4_capture_stress', False)),
     )
+    from md_benchmark.stress_mode import stress_disabled
+    from md_benchmark.capture_scope import scope_from_options
+    no_stress = stress_disabled(request.options)
+    potential.benchmark_capture_scope = scope_from_options(request.options)
     stress_potential = (
         _SingleSystemPotential(
             request.model_path,
@@ -867,7 +872,7 @@ def run_md(request):
             profiler=profiler,
             enable_cueq=False,
         )
-        if config.collect_trajectory and not potential.capture_stress
+        if config.collect_trajectory and not potential.capture_stress and not no_stress
         else None
     )
 
@@ -1087,13 +1092,13 @@ def run_md(request):
         )
 
     def record_frame(step: int) -> None:
-        if graph_md.stress is not None:
+        if graph_md.stress is not None or no_stress:
             stress_output = graph_md.output()
         else:
             if stress_potential is None:
                 raise RuntimeError('SevenNet trajectory stress evaluator is missing')
             stress_output = stress_potential(graph_md.positions)
-        if stress_output.stress is None:
+        if stress_output.stress is None and not no_stress:
             raise RuntimeError(
                 'SevenNet trajectory stress evaluator returned no stress'
             )

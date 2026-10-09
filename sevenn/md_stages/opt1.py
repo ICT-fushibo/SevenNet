@@ -446,9 +446,9 @@ def run_md(request):
     atomic_numbers = torch.tensor(
         atoms.get_atomic_numbers(), device=device, dtype=torch.long
     )
-    compute_stress = bool(
-        config.collect_trajectory or request.options.get('compute_stress', False)
-    )
+    from md_benchmark.stress_mode import wants_stress
+    compute_stress = wants_stress(request.options,
+        config.collect_trajectory or request.options.get('compute_stress', False))
     profiler = CudaPhaseProfiler(
         enabled=performance_profile_requested(request.options),
         device=device,
